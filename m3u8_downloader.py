@@ -1,5 +1,5 @@
 """
-M3U8 视频下载 & 合并工具 (支持 AES-128 解密)
+M3U8 视频下载 & 合并工具 (支持 AES-128 解密 + Hook 插件机制)
 
 用法:
     python m3u8_downloader.py <m3u8文件路径或URL> [选项]
@@ -7,8 +7,15 @@ M3U8 视频下载 & 合并工具 (支持 AES-128 解密)
 示例:
     # 本地 m3u8 文件, 下载并合并
     python m3u8_downloader.py video.m3u8 --base_url https://example.com/video/ -o merged.ts
-    # m3u8 URL, 仅下载不合并 (保留切片文件和 m3u8)
+    # m3u8 URL, 仅下载不合并
     python m3u8_downloader.py https://example.com/playlist.m3u8 --no-merge -o my_video
+    # 下载并上传到百度云盘
+    python m3u8_downloader.py video.m3u8 --base_url https://example.com/video/ -o merged.ts \\
+        --upload /apps/movies/my_video/ --upload-token YOUR_TOKEN
+    # 带 token 的加密密钥 (EXT-X-KEY)
+    python m3u8_downloader.py https://example.com/playlist.m3u8 --key-token YOUR_TOKEN
+    # 支持 KEYFORMAT=media-drm-token 的加密
+    python m3u8_downloader.py https://example.com/playlist.m3u8 --key-token YOUR_DRM_TOKEN
 """
 
 import argparse
@@ -19,6 +26,7 @@ import struct
 import sys
 import tempfile
 import time
+from abc import ABC
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Optional
@@ -51,6 +59,7 @@ class KeyInfo:
     key_uri: str = ""                       # 密钥下载地址
     key_data: bytes = b""                   # 下载后的密钥 (16字节)
     iv: Optional[bytes] = None              # 初始化向量 (16字节), None 表示用序号推导
+    key_format: Optional[str] = None        # 密钥格式, 如 "media-drm-token"
 
 
 @dataclass
@@ -124,6 +133,150 @@ class HTTPClient:
 
 
 # ---------------------------------------------------------------------------
+# Hook system
+# ---------------------------------------------------------------------------
+
+
+class BaseHook(ABC):
+    """Hook 基类 — 生命周期钩子/回调接口方法, 子类按需覆盖."""
+
+    def on_segment(self, index: int, segment: M3U8Segment, filepath: str) -> None:
+        """单个片段下载+解密成功时调用 (在 worker 线程中调用)."""
+
+    def on_segment_data(self, index: int, segment: M3U8Segment, data: bytes, filename: str) -> None:
+        """不落地模式: 直接接收字节数据 (在 worker 线程中调用)."""
+
+    def on_all_downloaded(self, playlist: M3U8Playlist, tmp_dir: str) -> None:
+        """所有片段下载完成后调用 (在主线程中调用)."""
+
+    def on_finish(self, result_path: str) -> None:
+        """整个流程结束后调用."""
+
+
+class SegmentMergeHook(BaseHook):
+    """默认合并钩子: 将下载的分片按顺序合并为单个文件, 或保留为目录.
+
+    merge=True  → 合并为 output (默认)
+    merge=False → 保留分片目录 + 拷贝 m3u8 到目录中
+    """
+
+    def __init__(
+        self,
+        output: str,
+        merge: bool = True,
+        keep_temp: bool = False,
+    ):
+        self.output = output
+        self.merge = merge
+        self.keep_temp = keep_temp
+
+    def on_all_downloaded(self, playlist: M3U8Playlist, tmp_dir: str) -> None:
+        if self.merge:
+            self._do_merge(tmp_dir, len(playlist))
+        else:
+            self._keep_segments(tmp_dir)
+
+    def _do_merge(self, tmp_dir: str, total: int) -> None:
+        """按顺序合并片段."""
+        print(f"[*] 合并片段到: {self.output}")
+
+        merge_iter: object = range(total)
+        if HAS_TQDM:
+            merge_iter = tqdm(merge_iter, desc="合并进度", unit="seg")
+
+        with open(self.output, "wb") as outfile:
+            for i in merge_iter:
+                path = os.path.join(tmp_dir, f"seg_{i:06d}")
+                if os.path.exists(path):
+                    with open(path, "rb") as infile:
+                        shutil.copyfileobj(infile, outfile)
+
+        if HAS_TQDM and isinstance(merge_iter, tqdm):
+            merge_iter.close()
+
+    def _keep_segments(self, tmp_dir: str) -> None:
+        """保留分片: 将临时目录重命名并拷贝 m3u8."""
+        # 还需要 downloader 的 m3u8 上下文, 这里通过 _m3u8_file 属性获取
+        m3u8_src: Optional[str] = getattr(self, "_m3u8_file", None)
+        m3u8_dest = os.path.join(tmp_dir, "index.m3u8")
+        if m3u8_src and os.path.isfile(m3u8_src):
+            shutil.copy(m3u8_src, m3u8_dest)
+
+        name, _ = os.path.splitext(self.output)
+        output_dir = name + "_segments"
+        if os.path.exists(output_dir):
+            shutil.rmtree(output_dir, ignore_errors=True)
+        shutil.move(tmp_dir, output_dir)
+
+    def on_finish(self, result_path: str) -> None:
+        if not self.keep_temp and self.merge:
+            # 清理临时目录 (分片已合并到 output)
+            pass  # 由外部处理
+
+
+class YunpanUploadHook(BaseHook):
+    """上传钩子: 每下载完一个分片就上传到百度云盘."""
+
+    def __init__(
+        self,
+        token: str,
+        remote_prefix: str,
+        ondup: str = "overwrite",
+        max_retries: int = 3,
+        delete_after_upload: bool = True,
+    ):
+        self.token = token
+        self.remote_prefix = remote_prefix.rstrip("/")
+        self.ondup = ondup
+        self.max_retries = max_retries
+        self.delete_after_upload = delete_after_upload
+        try:
+            from pan_upload import upload_file,upload_bytes
+            self.upload_file = upload_file
+            self.upload_bytes = upload_bytes
+        except ImportError:
+            print(f"[!] 无法导入 yunpan_hls")
+            return
+
+    def on_segment(self, index: int, segment: M3U8Segment, filepath: str) -> None:
+        remote_path = f"{self.remote_prefix}/{os.path.basename(filepath)}"
+        self._do_upload(filepath, remote_path)
+
+    def on_segment_data(self, index: int, segment: M3U8Segment, data: bytes, filename: str) -> None:
+        """不落地模式: 直接上传 bytes."""
+        remote_path = f"{self.remote_prefix}/seg_{index:06d}"
+        self._do_upload_bytes(data, filename, remote_path)
+
+    def _do_upload(self, local_path: str, remote_path: str) -> None:
+        try:
+            result = self.upload_file(
+                local_path=local_path,
+                remote_path=remote_path,
+                token=self.token,
+                ondup=self.ondup,
+                max_retries=self.max_retries,
+                delete_after_upload=self.delete_after_upload,
+            )
+            print(f"[*] 上传成功: {remote_path} (fs_id={result.get('fs_id', '?')})")
+        except Exception as e:
+            print(f"[!] 上传失败: {remote_path} — {e}")
+
+    def _do_upload_bytes(self, data: bytes, filename: str, remote_path: str) -> None:
+        try:
+            result = self.upload_bytes(
+                data=data,
+                filename=filename,
+                remote_path=remote_path,
+                token=self.token,
+                ondup=self.ondup,
+                max_retries=self.max_retries,
+            )
+            #print(f"[*] 上传成功: {remote_path} (fs_id={result.get('fs_id', '?')})")
+        except Exception as e:
+            print(f"[!] 上传失败: {remote_path} — {e}")
+
+
+# ---------------------------------------------------------------------------
 # M3U8Downloader
 # ---------------------------------------------------------------------------
 
@@ -131,7 +284,8 @@ _EXT_KEY_RE = re.compile(
     r"#EXT-X-KEY\s*:\s*"
     r"(?:.*?METHOD\s*=\s*([^,\s]+))?"
     r'(?:.*?URI\s*=\s*"([^"]*)")?'
-    r"(?:.*?IV\s*=\s*(0x[0-9a-fA-F]+))?",
+    r"(?:.*?IV\s*=\s*(0x[0-9a-fA-F]+))?"
+    r"(?:.*?KEYFORMAT\s*=\s*\"([^\"]+)\")?",
     re.IGNORECASE,
 )
 
@@ -142,7 +296,14 @@ DEFAULT_USER_AGENT = (
 
 
 class M3U8Downloader:
-    """M3U8 视频下载器: 获取 m3u8 → 解析 → 下载片段 → 解密 → 合并."""
+    """M3U8 视频下载器: 获取 m3u8 → 解析 → 下载片段 → 解密 → [hooks].
+
+    Hooks 说明:
+      - on_segment:      每段下载成功后调用 (在 worker 线程)
+      - on_all_downloaded: 全部下载完成后调用 (主线程)
+      - on_finish:       流程结束调用
+      默认注册 SegmentMergeHook 执行合并.
+    """
 
     def __init__(
         self,
@@ -153,7 +314,11 @@ class M3U8Downloader:
         retries: int = 3,
         no_merge: bool = False,
         keep_temp: bool = False,
+        no_disk: bool = False,
         http_client: Optional[HTTPClient] = None,
+        hooks: Optional[list[BaseHook]] = None,
+        key_param: Optional[str] = None,
+        key_format: Optional[str] = None,
     ):
         self.m3u8_source = m3u8_source
         self.output = output
@@ -162,7 +327,15 @@ class M3U8Downloader:
         self.retries = retries
         self.no_merge = no_merge
         self.keep_temp = keep_temp
+        self.no_disk = no_disk
         self.http = http_client or HTTPClient()
+        self.key_param = key_param
+        self.key_format = key_format
+
+        # 默认注册合并钩子 (除非 no_merge)
+        if hooks is None:
+            hooks = [SegmentMergeHook(output=output, merge=not no_merge, keep_temp=keep_temp)]
+        self.hooks = hooks
 
         # 内部状态
         self._tmp_m3u8_path: Optional[str] = None
@@ -187,50 +360,60 @@ class M3U8Downloader:
                 sys.exit(1)
             print("[*] 检测到 AES-128 加密, 密钥已加载")
 
+        # -- no_disk 模式: 下载后直接 on_segment_data, 不写磁盘 -------------------
+        if self.no_disk:
+            self._tmp_dir = tempfile.mkdtemp(prefix="m3u8_dl_")
+            self._download_segments_no_disk(playlist)
+            result = self.output
+            for hook in self.hooks:
+                hook.on_finish(result)
+            self._cleanup()
+            return result
+
+        # -- 正常流程 ---------------------------------------------------------
         self._tmp_dir = tempfile.mkdtemp(prefix="m3u8_dl_")
         print(f"[*] 临时目录: {self._tmp_dir}")
 
+        # 注入 m3u8 文件路径到 merge hook (no-merge 模式需要)
+        self._inject_m3u8_context()
+
         segment_paths = self._download_segments(playlist)
 
+        # 调用 on_all_downloaded
+        for hook in self.hooks:
+            hook.on_all_downloaded(playlist, self._tmp_dir)
+
+        result_path = self._finalize()
+        return result_path
+
+    def _inject_m3u8_context(self) -> None:
+        """将 m3u8 源文件路径注入到 SegmentMergeHook."""
+        m3u8_file = self._tmp_m3u8_path or (
+            self.m3u8_source if os.path.isfile(self.m3u8_source) else None
+        )
+        if m3u8_file is None:
+            return
+        for hook in self.hooks:
+            if isinstance(hook, SegmentMergeHook):
+                hook._m3u8_file = m3u8_file
+
+    def _finalize(self) -> str:
+        """收尾: 调用 on_finish, 清理临时文件, 打印结果."""
         if self.no_merge:
-            return self._finish_no_merge(playlist)
+            name, _ = os.path.splitext(self.output)
+            result = name + "_segments"
+            print(f"[*] 完成! 切片目录: {result}")
         else:
-            self._merge(segment_paths)
-            self._cleanup()
-            total_size_mb = os.path.getsize(self.output) / (1024 * 1024)
-            print(f"[*] 完成! 输出文件: {self.output} ({total_size_mb:.1f} MB)")
-            return self.output
+            result = self.output
+            if os.path.exists(self.output):
+                total_size_mb = os.path.getsize(self.output) / (1024 * 1024)
+                print(f"[*] 完成! 输出文件: {self.output} ({total_size_mb:.1f} MB)")
 
-    def _finish_no_merge(self, playlist: M3U8Playlist) -> str:
-        """不合并模式: 将 m3u8 拷贝到下载目录, 移动目录到指定名称, 返回路径."""
-        # 拷贝 / 写入 m3u8 文件到下载目录
-        m3u8_dest = os.path.join(self._tmp_dir, os.path.basename(self.output) or "index.m3u8")
-        if self._tmp_m3u8_path:
-            shutil.copy(self._tmp_m3u8_path, m3u8_dest)
-        elif os.path.isfile(self.m3u8_source):
-            shutil.copy(self.m3u8_source, m3u8_dest)
-        else:
-            # m3u8 内容是从 URL 获取的, 另存一份
-            with open(self._tmp_m3u8_path or m3u8_dest, "r", encoding="utf-8") as src:
-                with open(m3u8_dest, "w", encoding="utf-8") as dst:
-                    dst.write(src.read())
+        for hook in self.hooks:
+            hook.on_finish(result)
 
-        # 将临时目录移动到用户指定的输出名 (目录)
-        output_dir = self.output
-        # 如果 output 以 .ts/.mp4 等结尾, 去掉扩展名当做目录
-        name, _ = os.path.splitext(output_dir)
-        output_dir = name + "_segments"
-        if os.path.exists(output_dir):
-            shutil.rmtree(output_dir, ignore_errors=True)
-        shutil.move(self._tmp_dir, output_dir)
-        self._tmp_dir = output_dir
-
-        # 清理可能下载的临时 m3u8
-        if self._tmp_m3u8_path and os.path.exists(self._tmp_m3u8_path):
-            os.unlink(self._tmp_m3u8_path)
-
-        print(f"[*] 完成! 切片目录: {output_dir}")
-        return output_dir
+        self._cleanup()
+        return result
 
     # -- fetch & parse -------------------------------------------------------
 
@@ -239,7 +422,6 @@ class M3U8Downloader:
         if urlparse(self.m3u8_source).scheme in ("http", "https"):
             print(f"[*] 下载 m3u8 文件: {self.m3u8_source}")
             content = self.http.get_text(self.m3u8_source)
-            # 写临时文件, 后续键钥/片段相对路径以此为基准
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".m3u8", delete=False, encoding="utf-8"
             ) as tmp:
@@ -255,6 +437,7 @@ class M3U8Downloader:
         """解析 m3u8 文本内容."""
         playlist = M3U8Playlist()
         current_key: Optional[KeyInfo] = None
+        current_duration = 0.0
 
         for line in content.splitlines():
             line = line.strip()
@@ -268,9 +451,8 @@ class M3U8Downloader:
             elif line.startswith("#EXT-X-MEDIA-SEQUENCE:"):
                 playlist.media_sequence = int(line.split(":")[1])
             elif line.startswith("#EXTINF:"):
-                duration = float(line.split(":")[1].rstrip(","))
-                current_duration = duration
-            elif line.startswith("#EXT-X-KEY"):
+                current_duration = float(line.split(":")[1].rstrip(","))
+            elif line.startswith("#EXT-X-KEY"): #密钥 iv ,....
                 current_key = self._parse_key_line(line)
             elif not line.startswith("#"):
                 seg = M3U8Segment(uri=line, duration=current_duration, key=current_key)
@@ -289,10 +471,12 @@ class M3U8Downloader:
             return None
         if method == "AES-128":
             iv_str = m.group(3)
+            key_format = m.group(4) if m.group(4) else None
             return KeyInfo(
                 method=method,
                 key_uri=m.group(2) or "",
                 iv=bytes.fromhex(iv_str[2:]) if iv_str else None,
+                key_format=key_format,
             )
         print(f"[!] 不支持的加密方法: {method}, 按明文处理")
         return None
@@ -305,7 +489,6 @@ class M3U8Downloader:
             self.base_url = self.base_url.rstrip("/") + "/"
             print(f"[*] 根 URL (--base_url): {self.base_url}")
         elif self._tmp_m3u8_path is not None:
-            # 从 m3u8 URL 自动推导
             self.base_url = os.path.dirname(self.m3u8_source) + "/"
             print(f"[*] 根 URL (自动): {self.base_url}")
         elif self.m3u8_source and urlparse(self.m3u8_source).scheme in ("http", "https"):
@@ -320,24 +503,42 @@ class M3U8Downloader:
             sys.exit(f"[!] 无法拼接相对路径 '{uri}', 未提供 base_url")
         return urljoin(self.base_url, uri)
 
+    def _resolve_url_with_token(self, uri: str) -> str:
+        """将相对 URI 拼接为完整 URL 并附加 token 参数."""
+        from urllib.parse import parse_qs, parse_qsl,urlencode, urlparse, urlunparse
+
+        url = self._resolve_url(uri)
+        if not self.key_param:
+            return url
+
+        # 解析 URL 和查询参数
+        parsed = urlparse(url)
+        query_params = parse_qs(parsed.query) if parsed.query else {}
+
+        # 解析 key_param 为字典（parse_qsl 返回键值对元组列表）
+        new_params = dict(parse_qsl(self.key_param))
+        # 合并（新参数覆盖旧参数）
+        query_params.update(new_params)
+
+        # 重建 URL
+        new_query = urlencode(query_params, doseq=True)
+        return urlunparse(parsed._replace(query=new_query))
+
     # -- encryption ----------------------------------------------------------
 
     def _load_keys(self, playlist: M3U8Playlist) -> None:
         """下载加密密钥并计算每段的 IV."""
-        key_cache: dict[str, bytes] = {}  # key_uri -> key_data, 避免重复下载相同密钥
+        key_cache: dict[str, bytes] = {}
 
         for i, seg in enumerate(playlist.segments):
             if seg.key is None:
                 continue
-
-            # 下载密钥 (同一 URI 只下载一次)
             if seg.key.key_uri not in key_cache:
-                key_url = self._resolve_url(seg.key.key_uri)
+                key_url = self._resolve_url_with_token(seg.key.key_uri)
                 print(f"[*] 下载密钥: {key_url}")
                 key_cache[seg.key.key_uri] = self.http.get(key_url)
             seg.key.key_data = key_cache[seg.key.key_uri]
 
-            # 补全 IV
             if seg.key.iv is None:
                 seq = playlist.media_sequence + i
                 seg.key.iv = struct.pack(">Q", seq).rjust(16, b"\x00")
@@ -345,7 +546,7 @@ class M3U8Downloader:
     # -- download ------------------------------------------------------------
 
     def _download_segments(self, playlist: M3U8Playlist) -> list[str]:
-        """并发下载所有片段 (含解密), 返回按序号排列的临时文件路径列表."""
+        """并发下载所有片段 (含解密 + on_segment hook)."""
         urls = [self._resolve_url(seg.uri) for seg in playlist.segments]
         print(f"[*] 开始下载 (并发数: {self.workers})...")
 
@@ -359,7 +560,9 @@ class M3U8Downloader:
             for i, url in enumerate(urls):
                 dest = os.path.join(self._tmp_dir, f"seg_{i:06d}")
                 seg_key = playlist.segments[i].key
-                futures[executor.submit(self._download_single, url, dest, i, seg_key)] = i
+                futures[executor.submit(
+                    self._download_segment_task, url, dest, i, playlist.segments[i], seg_key
+                )] = i
 
             pbar = tqdm(total=total, desc="下载进度", unit="seg") if HAS_TQDM else None
 
@@ -385,13 +588,15 @@ class M3U8Downloader:
 
         return [p for p in paths if p is not None]
 
-    def _download_single(
-        self, url: str, dest: str, index: int, key_info: Optional[KeyInfo] = None
+    def _download_segment_task(
+        self,
+        url: str,
+        dest: str,
+        index: int,
+        segment: M3U8Segment,
+        key_info: Optional[KeyInfo] = None,
     ) -> tuple[int, str, str]:
-        """下载单个片段, 失败自动重试, 支持解密.
-
-        Returns (index, file_path, status).
-        """
+        """下载单个片段, 失败自动重试, 支持解密 + on_segment hook."""
         for attempt in range(self.retries):
             try:
                 raw = self.http.get(url)
@@ -399,12 +604,75 @@ class M3U8Downloader:
                     raw = self._decrypt(raw, key_info)
                 with open(dest, "wb") as f:
                     f.write(raw)
+                # 调用 on_segment hooks (在 worker 线程中)
+                for hook in self.hooks:
+                    hook.on_segment(index, segment, dest)
                 return (index, dest, "ok")
             except Exception as e:
                 if attempt == self.retries - 1:
                     return (index, "", f"失败: {e}")
                 time.sleep(1 * (attempt + 1))
         return (index, "", "unknown error")
+
+    def _download_segments_no_disk(self, playlist: M3U8Playlist) -> None:
+        """不落地下载: 下载解密后直接 on_segment_data, 不写磁盘."""
+        urls = [self._resolve_url(seg.uri) for seg in playlist.segments]
+        print(f"[*] 开始不落地下载 (并发数: {self.workers})...")
+        total = len(playlist)
+        success = 0
+        fail = 0
+
+        with ThreadPoolExecutor(max_workers=self.workers) as executor:
+            futures = {}
+            for i, url in enumerate(urls):
+                seg = playlist.segments[i]
+                futures[executor.submit(
+                    self._download_and_feed, url, i, seg, seg.key
+                )] = i
+
+            pbar = tqdm(total=total, desc="下载&上传", unit="seg") if HAS_TQDM else None
+
+            for future in as_completed(futures):
+                idx, status = future.result()
+                if status == "ok":
+                    success += 1
+                else:
+                    fail += 1
+                    tqdm.write(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
+
+                if pbar is not None:
+                    pbar.update(1)
+                elif (success + fail) % 100 == 0 or (success + fail) == total:
+                    print(f"  [*] 进度: {success + fail}/{total} (成功: {success}, 失败: {fail})")
+
+            if pbar is not None:
+                pbar.close()
+
+        if fail > 0:
+            print(f"[!] {fail} 个片段失败")
+
+    def _download_and_feed(
+        self,
+        url: str,
+        index: int,
+        segment: M3U8Segment,
+        key_info: Optional[KeyInfo] = None,
+    ) -> tuple[int, str]:
+        """下载 + 解密 + on_segment_data (不写磁盘)."""
+        for attempt in range(self.retries):
+            try:
+                raw = self.http.get(url)
+                if key_info is not None:
+                    raw = self._decrypt(raw, key_info)
+                filename = os.path.basename(urlparse(url).path) or f"seg_{index:06d}"
+                for hook in self.hooks:
+                    hook.on_segment_data(index, segment, raw, filename)
+                return (index, "ok")
+            except Exception as e:
+                if attempt == self.retries - 1:
+                    return (index, f"失败: {e}")
+                time.sleep(1 * (attempt + 1))
+        return (index, "unknown error")
 
     # -- decrypt -------------------------------------------------------------
 
@@ -413,31 +681,10 @@ class M3U8Downloader:
         """AES-128-CBC 解密并去除 PKCS7 填充."""
         cipher = AES.new(key_info.key_data, AES.MODE_CBC, iv=key_info.iv or b"\x00" * 16)
         decrypted = cipher.decrypt(data)
-        # PKCS7 去填充
         pad_len = decrypted[-1]
         if 1 <= pad_len <= 16:
             decrypted = decrypted[:-pad_len]
         return decrypted
-
-    # -- merge ---------------------------------------------------------------
-
-    def _merge(self, segment_paths: list[str]) -> None:
-        """按顺序合并片段."""
-        print(f"[*] 合并片段到: {self.output}")
-
-        merge_iter: object = range(len(segment_paths))
-        if HAS_TQDM:
-            merge_iter = tqdm(merge_iter, desc="合并进度", unit="seg")
-
-        with open(self.output, "wb") as outfile:
-            for i in merge_iter:
-                path = segment_paths[i] if i < len(segment_paths) else None
-                if path and os.path.exists(path):
-                    with open(path, "rb") as infile:
-                        shutil.copyfileobj(infile, outfile)
-
-        if HAS_TQDM and isinstance(merge_iter, tqdm):
-            merge_iter.close()
 
     # -- cleanup -------------------------------------------------------------
 
@@ -473,6 +720,18 @@ def _parse_headers(raw_headers: Optional[list[str]]) -> dict[str, str]:
     return headers
 
 
+def _load_token(token_arg: Optional[str]) -> Optional[str]:
+    """获取 ACCESS_TOKEN: 命令行 > .env."""
+    if token_arg:
+        return token_arg
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+        return os.getenv("ACCESS_TOKEN")
+    except ImportError:
+        return os.getenv("ACCESS_TOKEN")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="M3U8 视频下载 & 合并工具")
     parser.add_argument("m3u8_input", help="m3u8 文件路径或 URL")
@@ -484,9 +743,54 @@ def main() -> None:
     parser.add_argument("--header", "-H", action="append", default=None,
                         help="自定义请求头, 格式 Key:Value, 可多次指定. 例如 -H 'Referer:https://example.com'")
     parser.add_argument("--timeout", "-t", type=int, default=5, help="HTTP 请求超时秒数 (默认: 5)")
-    parser.add_argument("--retries", "-r", type=int, default=7, help="下载失败重试次数 (默认: 7)")
+    parser.add_argument("--retries", "-r", type=int, default=3, help="下载失败重试次数 (默认: 3)")
+    parser.add_argument("--key-param", default=None, help="EXT-X-KEY 请求时附加的参数")
+    parser.add_argument("--key-format", default=None, help="EXT-X-KEY 返回的格式")
     parser.add_argument("--no-merge", action="store_true", help="不合并片段, 仅下载到目录并保留 m3u8 文件")
+    parser.add_argument("--no-disk", action="store_true", help="不落磁盘, 下载后直接传给上传 hook 上传到云盘")
+
+    # --upload 选项组 需要根据 hls_yunpan的upload模块的参数来做传递/适配
+    parser.add_argument("--upload", "-u", default=None, metavar="REMOTE_DIR",
+                        help="上传到百度云盘, 后跟远程目录路径, 如 /apps/movies/my_video/")
+    parser.add_argument("--upload-token", default=None, help="百度 ACCESS_TOKEN (默认从 .env 读取)")
+    parser.add_argument("--upload-ondup", default="overwrite", choices=["fail", "overwrite", "newcopy"],
+                        help="云端冲突策略 (默认: overwrite)")
+    parser.add_argument("--upload-retries", type=int, default=5, help="上传重试次数 (默认: 3)")
+    parser.add_argument("--upload-delete", action="store_true", default=True,
+                        help="上传成功后删除本地分片 (默认)")
+    parser.add_argument("--no-upload-delete", action="store_false", dest="upload_delete",
+                        help="上传后保留本地分片")
+
     args = parser.parse_args()
+
+    # --no-disk 校验
+    if args.no_disk:
+        if not args.upload:
+            print("[!] --no-disk 需要配合 --upload 使用")
+            sys.exit(1)
+        if not args.no_merge:
+            print("[*] --no-disk 自动开启 --no-merge 模式 (数据不入磁盘无法合并)")
+            args.no_merge = True
+
+    # 构建 hooks
+    hooks: list[BaseHook] = [SegmentMergeHook(
+        output=args.output,
+        merge=not args.no_merge,
+        keep_temp=args.keep_temp,
+    )]
+
+    if args.upload:
+        token = _load_token(args.upload_token)
+        if not token:
+            print("[!] 启用 --upload 但未提供 ACCESS_TOKEN, 请用 --upload-token 指定或写入 .env")
+            sys.exit(1)
+        hooks.append(YunpanUploadHook(
+            token=token,
+            remote_prefix=args.upload,
+            ondup=args.upload_ondup,
+            max_retries=args.upload_retries,
+            delete_after_upload=args.upload_delete,
+        ))
 
     headers = _parse_headers(args.header)
     http = HTTPClient(headers=headers, proxy=args.proxy, timeout=args.timeout)
@@ -499,7 +803,11 @@ def main() -> None:
         retries=args.retries,
         no_merge=args.no_merge,
         keep_temp=args.keep_temp,
+        no_disk=args.no_disk,
         http_client=http,
+        hooks=hooks,
+        key_param=args.key_param,
+        key_format=args.key_format
     )
     downloader.run()
 
