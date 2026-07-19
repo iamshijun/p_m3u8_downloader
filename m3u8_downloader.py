@@ -141,7 +141,7 @@ class BaseHook(ABC):
     """Hook 基类 — 生命周期钩子/回调接口方法, 子类按需覆盖."""
 
     def on_segment(self, index: int, segment: M3U8Segment, filepath: str) -> None:
-        """单个片段下载+解密成功时调用 (在 worker 线程中调用)."""
+        """单个片段下载(落地到文件)+解密成功时调用 (在 worker 线程中调用)."""
 
     def on_segment_data(self, index: int, segment: M3U8Segment, data: bytes, filename: str) -> None:
         """不落地模式: 直接接收字节数据 (在 worker 线程中调用)."""
@@ -158,6 +158,9 @@ class SegmentMergeHook(BaseHook):
 
     merge=True  → 合并为 output (默认)
     merge=False → 保留分片目录 + 拷贝 m3u8 到目录中
+    keep-temp=True → 保留临时目录, 不删除
+    keep-temp=False → 移动临时目录 (默认)到目标目录 ${output}_segments
+    tmp_dir → hls媒体片段临时目录 
     """
 
     def __init__(
@@ -165,10 +168,12 @@ class SegmentMergeHook(BaseHook):
         output: str,
         merge: bool = True,
         keep_temp: bool = False,
+        tmp_dir: Optional[str] = None,
     ):
         self.output = output
         self.merge = merge
         self.keep_temp = keep_temp
+        self.tmp_dir = tmp_dir
 
     def on_all_downloaded(self, playlist: M3U8Playlist, tmp_dir: str) -> None:
         if self.merge:
@@ -195,17 +200,24 @@ class SegmentMergeHook(BaseHook):
             merge_iter.close()
 
     def _keep_segments(self, tmp_dir: str) -> None:
-        """保留分片: 将临时目录重命名并拷贝 m3u8."""
-        # 还需要 downloader 的 m3u8 上下文, 这里通过 _m3u8_file 属性获取
+        """保留分片: 将临时目录重命名并拷贝 m3u8文件."""
+        #  _m3u8_file 属性获取为 注入到 hook的属性
         m3u8_src: Optional[str] = getattr(self, "_m3u8_file", None)
-        m3u8_dest = os.path.join(tmp_dir, "index.m3u8")
+        m3u8_dest = os.path.join(tmp_dir, "playlist.m3u8")
         if m3u8_src and os.path.isfile(m3u8_src):
+            os.makedirs(os.path.dirname(m3u8_dest), exist_ok=True)
             shutil.copy(m3u8_src, m3u8_dest)
 
+        # 如果指定了keep_temp，直接使用该目录，不再移动到 {output}_segments
+        if self.keep_temp:
+            print(f"[*] 已使用指定临时目录: {tmp_dir}")
+            return
+        
         name, _ = os.path.splitext(self.output)
         output_dir = name + "_segments"
         if os.path.exists(output_dir):
             shutil.rmtree(output_dir, ignore_errors=True)
+        print(f'[*] 移动临时目录到: {output_dir}')
         shutil.move(tmp_dir, output_dir)
 
     def on_finish(self, result_path: str) -> None:
@@ -313,6 +325,7 @@ class M3U8Downloader:
         workers: int = 10,
         retries: int = 3,
         no_merge: bool = False,
+        tmp_dir : Optional[str] = None,
         keep_temp: bool = False,
         no_disk: bool = False,
         http_client: Optional[HTTPClient] = None,
@@ -331,15 +344,16 @@ class M3U8Downloader:
         self.http = http_client or HTTPClient()
         self.key_param = key_param
         self.key_format = key_format
+        self.tmp_dir = tmp_dir
 
         # 默认注册合并钩子 (除非 no_merge)
         if hooks is None:
-            hooks = [SegmentMergeHook(output=output, merge=not no_merge, keep_temp=keep_temp)]
+            hooks = [SegmentMergeHook(output=output, merge=not no_merge, keep_temp=keep_temp, tmp_dir=tmp_dir)]
         self.hooks = hooks
 
         # 内部状态
+        # 下载的m3u8文件存放的临时路径 (ps:完成后暂时不会被删除)
         self._tmp_m3u8_path: Optional[str] = None
-        self._tmp_dir: Optional[str] = None
 
     # -- public API ----------------------------------------------------------
 
@@ -360,9 +374,11 @@ class M3U8Downloader:
                 sys.exit(1)
             print("[*] 检测到 AES-128 加密, 密钥已加载")
 
+        if not self.tmp_dir: #如果没有指定创建一个
+            self.tmp_dir = tempfile.mkdtemp(prefix="m3u8_dl_")
+        print(f"[*] 临时目录: {self.tmp_dir}")
         # -- no_disk 模式: 下载后直接 on_segment_data, 不写磁盘 -------------------
         if self.no_disk:
-            self._tmp_dir = tempfile.mkdtemp(prefix="m3u8_dl_")
             self._download_segments_no_disk(playlist)
             result = self.output
             for hook in self.hooks:
@@ -371,8 +387,6 @@ class M3U8Downloader:
             return result
 
         # -- 正常流程 ---------------------------------------------------------
-        self._tmp_dir = tempfile.mkdtemp(prefix="m3u8_dl_")
-        print(f"[*] 临时目录: {self._tmp_dir}")
 
         # 注入 m3u8 文件路径到 merge hook (no-merge 模式需要)
         self._inject_m3u8_context()
@@ -381,7 +395,7 @@ class M3U8Downloader:
 
         # 调用 on_all_downloaded
         for hook in self.hooks:
-            hook.on_all_downloaded(playlist, self._tmp_dir)
+            hook.on_all_downloaded(playlist, self.tmp_dir)
 
         result_path = self._finalize()
         return result_path
@@ -400,9 +414,14 @@ class M3U8Downloader:
     def _finalize(self) -> str:
         """收尾: 调用 on_finish, 清理临时文件, 打印结果."""
         if self.no_merge:
-            name, _ = os.path.splitext(self.output)
-            result = name + "_segments"
-            print(f"[*] 完成! 切片目录: {result}")
+            # 如果指定了keep-temp ，直接使用该目录
+            if self.keep_temp:
+                result = self.tmp_dir
+                print(f"[*] 完成! 切片目录: {result}")
+            else:
+                name, _ = os.path.splitext(self.output)
+                result = name + "_segments"
+                print(f"[*] 完成! 切片目录: {result}")
         else:
             result = self.output
             if os.path.exists(self.output):
@@ -504,7 +523,7 @@ class M3U8Downloader:
         return urljoin(self.base_url, uri)
 
     def _resolve_url_with_token(self, uri: str) -> str:
-        """将相对 URI 拼接为完整 URL 并附加 token 参数."""
+        """将相对 URI 拼接为完整 URL 并按需 附加其他参数."""
         from urllib.parse import parse_qs, parse_qsl,urlencode, urlparse, urlunparse
 
         url = self._resolve_url(uri)
@@ -558,7 +577,8 @@ class M3U8Downloader:
         with ThreadPoolExecutor(max_workers=self.workers) as executor:
             futures = {}
             for i, url in enumerate(urls):
-                dest = os.path.join(self._tmp_dir, f"seg_{i:06d}")
+                #统一为6位的seg片段标识
+                dest = os.path.join(self.tmp_dir, f"seg_{i:06d}")
                 seg_key = playlist.segments[i].key
                 futures[executor.submit(
                     self._download_segment_task, url, dest, i, playlist.segments[i], seg_key
@@ -573,7 +593,10 @@ class M3U8Downloader:
                     paths[idx] = filepath
                 else:
                     fail += 1
-                    tqdm.write(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
+                    if HAS_TQDM:
+                        tqdm.write(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
+                    else:
+                        print(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
 
                 if pbar is not None:
                     pbar.update(1)
@@ -638,7 +661,10 @@ class M3U8Downloader:
                     success += 1
                 else:
                     fail += 1
-                    tqdm.write(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
+                    if HAS_TQDM:
+                        tqdm.write(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
+                    else:
+                        print(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
 
                 if pbar is not None:
                     pbar.update(1)
@@ -691,12 +717,13 @@ class M3U8Downloader:
     def _cleanup(self) -> None:
         """清理临时文件."""
         if self.keep_temp:
-            if self._tmp_dir:
-                print(f"[*] 临时文件保留在: {self._tmp_dir}")
-            return
-        print("[*] 清理临时文件...")
-        if self._tmp_dir:
-            shutil.rmtree(self._tmp_dir, ignore_errors=True)
+            if self.tmp_dir:
+                print(f"[*] 临时文件保留在: {self.tmp_dir}")
+        else:
+            print("[*] 清理临时文件...")
+            if self.tmp_dir:
+                shutil.rmtree(self.tmp_dir, ignore_errors=True)
+                
         if self._tmp_m3u8_path and os.path.exists(self._tmp_m3u8_path):
             os.unlink(self._tmp_m3u8_path)
 
@@ -738,6 +765,7 @@ def main() -> None:
     parser.add_argument("--base_url", default=None, help="视频片段的根 URL (片段为相对路径时需要)")
     parser.add_argument("--output", "-o", default="output.ts", help="输出文件名 (默认: output.ts)")
     parser.add_argument("--workers", "-w", type=int, default=10, help="并发下载线程数 (默认: 10)")
+    parser.add_argument("--tmp-dir", default=None, help="显式指定临时下载目录")
     parser.add_argument("--keep-temp", action="store_true", help="保留临时下载目录不删除")
     parser.add_argument("--proxy", "-p", default=None, help="代理地址, 例如 http://127.0.0.1:7890")
     parser.add_argument("--header", "-H", action="append", default=None,
@@ -803,6 +831,7 @@ def main() -> None:
         retries=args.retries,
         no_merge=args.no_merge,
         keep_temp=args.keep_temp,
+        tmp_dir=args.tmp_dir,
         no_disk=args.no_disk,
         http_client=http,
         hooks=hooks,
