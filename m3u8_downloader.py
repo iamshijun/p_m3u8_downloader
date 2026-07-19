@@ -10,12 +10,8 @@ M3U8 视频下载 & 合并工具 (支持 AES-128 解密 + Hook 插件机制)
     # m3u8 URL, 仅下载不合并
     python m3u8_downloader.py https://example.com/playlist.m3u8 --no-merge -o my_video
     # 下载并上传到百度云盘
-    python m3u8_downloader.py video.m3u8 --base_url https://example.com/video/ -o merged.ts \\
+    python m3u8_downloader.py video.m3u8 --base_url https://example.com/video/ -no-disk \
         --upload /apps/movies/my_video/ --upload-token YOUR_TOKEN
-    # 带 token 的加密密钥 (EXT-X-KEY)
-    python m3u8_downloader.py https://example.com/playlist.m3u8 --key-token YOUR_TOKEN
-    # 支持 KEYFORMAT=media-drm-token 的加密
-    python m3u8_downloader.py https://example.com/playlist.m3u8 --key-token YOUR_DRM_TOKEN
 """
 
 import argparse
@@ -45,6 +41,80 @@ try:
     HAS_TQDM = True
 except ImportError:
     HAS_TQDM = False
+
+
+# ---------------------------------------------------------------------------
+# Progress Manager
+# ---------------------------------------------------------------------------
+
+
+class ProgressBar:
+    """进度条管理器：统一封装 tqdm 和 print 的逻辑."""
+
+    def __init__(self, total: Optional[int] = None, desc: str = "", unit: str = "item"):
+        """初始化进度条.
+
+        Args:
+            total: 总数，None 表示不确定
+            desc: 描述文本
+            unit: 单位
+        """
+        self.total = total
+        self.desc = desc
+        self.unit = unit
+        self.pbar = None
+        self.use_pbar = HAS_TQDM and total is not None
+
+    def __enter__(self):
+        """支持 with 语法."""
+        if self.use_pbar:
+            self.pbar = tqdm(total=self.total, desc=self.desc, unit=self.unit)
+        return self
+
+    def __exit__(self, *args):
+        """退出 with 语法，自动关闭进度条."""
+        self.close()
+
+    def update(self, n: int = 1) -> None:
+        """更新进度.
+
+        Args:
+            n: 增量，默认 1
+        """
+        if self.use_pbar and self.pbar:
+            self.pbar.update(n)
+            return True
+        return False
+
+    def write(self, msg: str) -> None:
+        """输出消息（支持tqdm的环境）.
+
+        Args:
+            msg: 消息内容
+        """
+        if self.use_pbar and self.pbar:
+            tqdm.write(msg)
+        else:
+            print(msg)
+
+    def close(self) -> None:
+        """关闭进度条."""
+        if self.use_pbar and self.pbar:
+            self.pbar.close()
+
+    @staticmethod
+    def simple_progress(current: int, total: int, desc: str = "") -> str:
+        """生成简单的文本进度信息.
+
+        Args:
+            current: 当前进度
+            total: 总数
+            desc: 描述
+
+        Returns:
+            进度字符串，如 "进度: 10/20"
+        """
+        return f"{desc}: {current}/{total}"
 
 # ---------------------------------------------------------------------------
 # Domain objects
@@ -185,19 +255,14 @@ class SegmentMergeHook(BaseHook):
         """按顺序合并片段."""
         print(f"[*] 合并片段到: {self.output}")
 
-        merge_iter: object = range(total)
-        if HAS_TQDM:
-            merge_iter = tqdm(merge_iter, desc="合并进度", unit="seg")
-
-        with open(self.output, "wb") as outfile:
-            for i in merge_iter:
-                path = os.path.join(tmp_dir, f"seg_{i:06d}")
-                if os.path.exists(path):
-                    with open(path, "rb") as infile:
-                        shutil.copyfileobj(infile, outfile)
-
-        if HAS_TQDM and isinstance(merge_iter, tqdm):
-            merge_iter.close()
+        with ProgressBar(total=total, desc="合并进度", unit="seg") as pbar:
+            with open(self.output, "wb") as outfile:
+                for i in range(total):
+                    path = os.path.join(tmp_dir, f"seg_{i:06d}")
+                    if os.path.exists(path):
+                        with open(path, "rb") as infile:
+                            shutil.copyfileobj(infile, outfile)
+                    pbar.update(1)
 
     def _keep_segments(self, tmp_dir: str) -> None:
         """保留分片: 将临时目录重命名并拷贝 m3u8文件."""
@@ -574,37 +639,29 @@ class M3U8Downloader:
         fail = 0
         total = len(playlist)
 
-        with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            futures = {}
-            for i, url in enumerate(urls):
-                #统一为6位的seg片段标识
-                dest = os.path.join(self.tmp_dir, f"seg_{i:06d}")
-                seg_key = playlist.segments[i].key
-                futures[executor.submit(
-                    self._download_segment_task, url, dest, i, playlist.segments[i], seg_key
-                )] = i
+        with ProgressBar(total=total, desc="下载进度", unit="seg") as pbar:
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                futures = {}
+                for i, url in enumerate(urls):
+                    #统一为6位的seg片段标识
+                    dest = os.path.join(self.tmp_dir, f"seg_{i:06d}")
+                    seg_key = playlist.segments[i].key
+                    futures[executor.submit(
+                        self._download_segment_task, url, dest, i, playlist.segments[i], seg_key
+                    )] = i
 
-            pbar = tqdm(total=total, desc="下载进度", unit="seg") if HAS_TQDM else None
-
-            for future in as_completed(futures):
-                idx, filepath, status = future.result()
-                if status == "ok":
-                    success += 1
-                    paths[idx] = filepath
-                else:
-                    fail += 1
-                    if HAS_TQDM:
-                        tqdm.write(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
+                for future in as_completed(futures):
+                    idx, filepath, status = future.result()
+                    if status == "ok":
+                        success += 1
+                        paths[idx] = filepath
                     else:
-                        print(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
+                        fail += 1
+                        pbar.write(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
 
-                if pbar is not None:
-                    pbar.update(1)
-                elif (success + fail) % 100 == 0 or (success + fail) == total:
-                    print(f"  [*] 进度: {success + fail}/{total} (成功: {success}, 失败: {fail})")
-
-            if pbar is not None:
-                pbar.close()
+                    if not pbar.update(1):
+                        if (success + fail) % 100 == 0 or (success + fail) == total:
+                            pbar.write(f"  [*] 进度: {ProgressBar.simple_progress(success + fail, total, '进度')} (成功: {success}, 失败: {fail})")
 
         if fail > 0:
             print(f"[!] {fail} 个片段下载失败, 合并结果可能不完整")
@@ -645,34 +702,26 @@ class M3U8Downloader:
         success = 0
         fail = 0
 
-        with ThreadPoolExecutor(max_workers=self.workers) as executor:
-            futures = {}
-            for i, url in enumerate(urls):
-                seg = playlist.segments[i]
-                futures[executor.submit(
-                    self._download_and_feed, url, i, seg, seg.key
-                )] = i
+        with ProgressBar(total=total, desc="下载&上传", unit="seg") as pbar:
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                futures = {}
+                for i, url in enumerate(urls):
+                    seg = playlist.segments[i]
+                    futures[executor.submit(
+                        self._download_and_feed, url, i, seg, seg.key
+                    )] = i
 
-            pbar = tqdm(total=total, desc="下载&上传", unit="seg") if HAS_TQDM else None
-
-            for future in as_completed(futures):
-                idx, status = future.result()
-                if status == "ok":
-                    success += 1
-                else:
-                    fail += 1
-                    if HAS_TQDM:
-                        tqdm.write(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
+                for future in as_completed(futures):
+                    idx, status = future.result()
+                    if status == "ok":
+                        success += 1
                     else:
-                        print(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
+                        fail += 1
+                        pbar.write(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
 
-                if pbar is not None:
-                    pbar.update(1)
-                elif (success + fail) % 100 == 0 or (success + fail) == total:
-                    print(f"  [*] 进度: {success + fail}/{total} (成功: {success}, 失败: {fail})")
-
-            if pbar is not None:
-                pbar.close()
+                    if not pbar.update(1):
+                        if (success + fail) % 100 == 0 or (success + fail) == total:
+                            pbar.write(f"  [*] 进度: {ProgressBar.simple_progress(success + fail, total, '进度')} (成功: {success}, 失败: {fail})")
 
         if fail > 0:
             print(f"[!] {fail} 个片段失败")
