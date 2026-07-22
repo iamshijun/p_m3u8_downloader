@@ -1,0 +1,29 @@
+{
+  "user_agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+  "default_proxy": "http://127.0.0.1:8001",
+  "domains": {
+    "missav.ai": {
+      "proxy": "http://127.0.0.1:8001",
+      "headers": {
+        "Referer": "https://missav.ai/ja"
+      }
+    },
+    "7mmtv.sx": {
+      "proxy": "",
+      "headers": {
+        "Referer": "https://7mmtv.sx"
+      }
+    },
+    "surrit.store": {
+      "proxy": "",
+      "headers": {
+        "Referer": "https://surrit.store/",
+        "Origin": "https://surrit.store/"
+      }
+    },
+    "wowstream2.cloud": {
+      "proxy": "",
+      "headers": {}
+    }
+  }
+}

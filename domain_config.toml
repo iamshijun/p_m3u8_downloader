@@ -1,0 +1,22 @@
+user_agent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+default_proxy = "http://127.0.0.1:8001"
+
+[domains."default"]
+headers = { Referer = "https://missav.ai/ja" } 
+proxy = "http://127.0.0.1:8001"
+
+
+[domains."surrit.store"]
+headers = { Referer = "https://missav.ai/ja" } 
+proxy = "http://127.0.0.1:8001"
+
+[domains."surrit.com"]
+headers = { Referer = "https://missav.ai/ja" } 
+proxy = "http://127.0.0.1:8001"
+
+[domains."wowstream2.cloud"]
+
+[domains."streamsuperpro.com"]
+headers = { Referer = "https://7mmtv.sx" }
+args = " -r 7 -t 25"
+#proxy = "http://127.0.0.1:8001"

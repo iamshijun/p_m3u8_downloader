@@ -33,7 +33,28 @@ pipeline: fetch → parse → resolve_base_url → load_keys → download_segmen
 
 When `--no-merge` is set, the merge step is skipped; downloaded segments and the m3u8 file are moved to `{output}_segments/` directory.
 
-## Wrapper scripts
+## Unified Downloader
+
+The `unified_downloader.py` script replaces individual wrapper scripts with intelligent domain detection:
+
+```bash
+# Auto-detects domain and applies appropriate configuration
+python3 unified_downloader.py <m3u8_url> [options...]
+
+# Examples:
+python3 unified_downloader.py https://missav.ai/video.m3u8
+python3 unified_downloader.py https://7mmtv.sx/video.m3u8 --no-merge
+
+# View configuration
+python3 unified_downloader.py --config
+
+# Get help
+python3 unified_downloader.py --help
+```
+
+Domain configuration is stored in `domain_config.{json,toml}`. The script tries TOML first (if `toml` package is installed), then falls back to JSON.
+
+## Legacy Wrapper scripts
 
 - `start_download.sh` — generic wrapper with User-Agent header
 - `missav_download.sh` — for missav.ai (proxy + Referer)
