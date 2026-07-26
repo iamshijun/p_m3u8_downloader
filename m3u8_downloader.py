@@ -157,7 +157,18 @@ class M3U8Playlist:
     def __len__(self) -> int:
         return len(self.segments)
 
-
+    def to_file_content(self,seg_format = "seg_{:06d}") -> str:
+        lines = []
+        lines.append('#EXTM3U')
+        lines.append(f'#EXT-X-VERSION:{self.version}')
+        lines.append(f'#EXT-X-TARGETDURATION:5:{self.version}')
+        lines.append("#EXT-X-MEDIA-SEQUENCE:0")
+        lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
+        for index,segment in enumerate(self.segments):
+            lines.append(f"#EXTINF:{segment.duration},")
+            lines.append(seg_format.format(index))
+            
+        return os.linesep.join(lines)
 # ---------------------------------------------------------------------------
 # HTTPClient
 # ---------------------------------------------------------------------------
@@ -209,6 +220,9 @@ class HTTPClient:
 
 class BaseHook(ABC):
     """Hook 基类 — 生命周期钩子/回调接口方法, 子类按需覆盖."""
+    
+    def on_playlist_parsed(self, playlist: M3U8Playlist) -> None:
+        """m3u8 解析完成后调用 (在主线程中调用)."""
 
     def on_segment(self, index: int, segment: M3U8Segment, filepath: str) -> None:
         """单个片段下载(落地到文件)+解密成功时调用 (在 worker 线程中调用)."""
@@ -314,6 +328,11 @@ class YunpanUploadHook(BaseHook):
         except ImportError:
             print(f"[!] 无法导入 yunpan_hls")
             return
+
+    def on_playlist_parsed(self, playlist: M3U8Playlist):
+        content = playlist.to_file_content()
+        print("[*] upload m3u8 to ", f"{self.remote_prefix}/playlist.m3u8")
+        self._do_upload_bytes(content.encode("utf-8"), "playlist.m3u8", f"{self.remote_prefix}/playlist.m3u8")
 
     def on_segment(self, index: int, segment: M3U8Segment, filepath: str) -> None:
         remote_path = f"{self.remote_prefix}/{os.path.basename(filepath)}"
@@ -438,6 +457,9 @@ class M3U8Downloader:
                 print("[!] 检测到加密片段, 但未安装 pycryptodome. 请运行: pip install pycryptodome")
                 sys.exit(1)
             print("[*] 检测到 AES-128 加密, 密钥已加载")
+            
+        for hook in self.hooks:
+            hook.on_playlist_parsed(playlist)
 
         if not self.tmp_dir: #如果没有指定创建一个
             self.tmp_dir = tempfile.mkdtemp(prefix="m3u8_dl_")

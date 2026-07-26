@@ -203,19 +203,11 @@ def create_parser():
 
     # Positional argument - M3U8 URL or file path
     parser.add_argument("m3u8_input", help="M3U8 file path or URL")
-
+    parser.add_argument("--upload", "-u", default=None, metavar="REMOTE_DIR",
+                        help="上传到百度云盘, 后跟远程目录路径, 如 /apps/movies/my_video/")
     # Options
     parser.add_argument("--config", action="store_true",
                        help="Show current domain configuration")
-    parser.add_argument("--proxy", "-p",
-                       help="Override proxy for the domain")
-    parser.add_argument("--header", "-H", action="append",
-                       help="Add custom header (Key:Value), can be used multiple times")
-
-    # Debug and informational
-    parser.add_argument("--verbose", "-v", action="store_true",
-                       help="Enable verbose output")
-
     return parser
 
 
@@ -226,14 +218,12 @@ def main():
     # Load configuration
     config_manager = ConfigManager(script_dir)
 
-    # Check for config command before parsing arguments
-    if len(sys.argv) >= 2 and sys.argv[1] == '--config':
-        show_config(config_manager)
-        sys.exit(0)
-
     # Create argument parser
     parser = create_parser()
     args = parser.parse_args()
+    if args.config : 
+        show_config(config_manager)
+        sys.exit(0)
 
     # Extract M3U8 URL from arguments
     m3u8_url = args.m3u8_input
@@ -249,29 +239,14 @@ def main():
     if "user_agent" not in domain_config or not domain_config["user_agent"]:
         # Use default user agent if not set in domain config
         domain_config["user_agent"] = config_manager.get_user_agent()
-
-    # Build configuration arguments (excluding proxy if it will be overridden)
-    temp_config = domain_config.copy()
-    if args.proxy:
-        temp_config.pop('proxy', None)  # Remove proxy from config if user specified one
-    config_args = DomainProcessor.build_config_args(temp_config, sys.argv[1:])
-
-    # Add user-specified headers
-    if args.header:
-        for header in args.header:
-            config_args.extend(['-H', header])
-
-    # Handle user-specified proxy - completely replace domain config
-    if args.proxy:
-        # Add user-specified proxy (it will override any from config)
-        config_args.extend(['--proxy', args.proxy])
+ 
+    config_args = DomainProcessor.build_config_args(domain_config, sys.argv[1:])
 
     # Prepare all arguments for the original downloader
     downloader_path = os.path.join(script_dir, 'm3u8_downloader.py')
 
-    if args.verbose:
-        print(f"Executing: python3 {downloader_path} {' '.join([m3u8_url] + config_args)}", file=sys.stderr)
-
+    if args.upload:
+        config_args.extend(['--upload', args.upload])
     # Execute the original downloader with all arguments
     all_args = ['python3', downloader_path, m3u8_url] + config_args
     os.execv(sys.executable, all_args)

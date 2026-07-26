@@ -6,10 +6,10 @@ Baidu Yunpan upload tool (standalone CLI).
     python -m app.upload video.ts --retries 5
 
     # Directory with resume, 5 parallel workers
-    python -m app.upload ./my_videos -r /apps/movies/my_videos -w 5
+    python -m app.upload ./my_videos /apps/movies/my_videos -w 5
 
     # Skip files larger than 100MB
-    python -m app.upload ./my_videos -r /apps/movies/my_videos --max-size 100MB
+    python -m app.upload ./my_videos /apps/movies/my_videos --max-size 100MB
 
     # Keep local file after upload
     python -m app.upload video.ts --no-delete-after-upload
@@ -137,7 +137,10 @@ def _do_upload_raw(local_path: Path, remote_path: str, token: str, ondup: str) -
             files={"file": (local_path.name, fh, "application/octet-stream")},
             timeout=httpx.Timeout(600.0, connect=30.0),
         )
-    response.raise_for_status()
+    #response.raise_for_status()
+    if response.status_code != 200:
+        print(f'response code {response.status_code} body: {response.text}')
+        raise RuntimeError(f"HTTP error {response.status_code}: {response.text}")
     result: dict = response.json()
 
     errno = result.get("errno")
@@ -260,7 +263,11 @@ def _do_upload_bytes(data: bytes, filename: str, remote_path: str, token: str, o
         files={"file": (filename, io.BytesIO(data), "application/octet-stream")},
         timeout=httpx.Timeout(600.0, connect=30.0),
     )
-    response.raise_for_status()
+    #response.raise_for_status()
+    if response.status_code != 200:
+        print(f'response code {response.status_code} body: {response.text}')
+        raise RuntimeError(f"HTTP error {response.status_code}: {response.text}")
+    
     result: dict = response.json()
 
     errno = result.get("errno")
@@ -578,7 +585,7 @@ Examples:
         "--ondup",
         "-o",
         choices=["fail", "overwrite", "newcopy"],
-        default="fail",
+        default="overwrite",
         help="Action when target file already exists (default: fail).",
     )
     parser.add_argument(
@@ -643,7 +650,7 @@ def main() -> None:
         remote_path = args.remote_path
     else:
         remote_path = f"{DEFAULT_REMOTE_PREFIX}/{path_arg.name}"
-
+    
     if path_arg.is_dir():
         upload_directory(
             local_dir=str(path_arg),
