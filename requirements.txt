@@ -1,0 +1,6 @@
+#tqdm 非必须
+#toml 如果没有读取 json配置
+
+#下面是如果需要上传的
+python-dotenv==1.0.0
+httpx==0.24.1

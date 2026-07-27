@@ -161,13 +161,14 @@ class M3U8Playlist:
         lines = []
         lines.append('#EXTM3U')
         lines.append(f'#EXT-X-VERSION:{self.version}')
-        lines.append(f'#EXT-X-TARGETDURATION:5:{self.version}')
+        lines.append(f'#EXT-X-TARGETDURATION:{self.target_duration}')
         lines.append("#EXT-X-MEDIA-SEQUENCE:0")
         lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
         for index,segment in enumerate(self.segments):
             lines.append(f"#EXTINF:{segment.duration},")
             lines.append(seg_format.format(index))
-            
+           
+        lines.append("#EXT-X-ENDLIST") 
         return os.linesep.join(lines)
 # ---------------------------------------------------------------------------
 # HTTPClient
