@@ -4,3 +4,8 @@
 #下面是如果需要上传的
 python-dotenv==1.0.0
 httpx==0.24.1
+
+#下面是 api_server.py (FastAPI 封装) 依赖
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.0
