@@ -315,6 +315,51 @@ function apiUrl(path) {
   return base + path.replace(/^\//, "");
 }
 
+// ---- 表单记忆 (localStorage) --------------------------------------------
+// 需要持久化的表单字段 id
+const FORM_FIELDS = [
+  "m3u8_input", "output", "base_url", "workers", "retries", "timeout",
+  "proxy", "key_param", "headers",
+  "no_merge", "keep_temp", "no_disk",
+  "upload", "upload_token", "upload_ondup", "upload_retries", "upload_delete",
+];
+const FORM_STORE_KEY = "m3u8_last_form";
+
+// 读取单个字段的值 (兼容 checkbox / 普通输入)
+function getFieldValue(id) {
+  const el = $(id);
+  if (!el) return undefined;
+  return el.type === "checkbox" ? el.checked : el.value;
+}
+
+// 写入单个字段的值
+function setFieldValue(id, value) {
+  const el = $(id);
+  if (!el || value === undefined || value === null) return;
+  if (el.type === "checkbox") el.checked = !!value;
+  else el.value = value;
+}
+
+// 保存当前表单到 localStorage
+function saveForm() {
+  const data = {};
+  for (const id of FORM_FIELDS) {
+    const v = getFieldValue(id);
+    if (v !== undefined) data[id] = v;
+  }
+  try { localStorage.setItem(FORM_STORE_KEY, JSON.stringify(data)); }
+  catch (e) { /* 隐私模式/超配额时忽略 */ }
+}
+
+// 从 localStorage 恢复表单
+function restoreForm() {
+  let data;
+  try { data = JSON.parse(localStorage.getItem(FORM_STORE_KEY) || "null"); }
+  catch (e) { return; }
+  if (!data) return;
+  for (const id of FORM_FIELDS) setFieldValue(id, data[id]);
+}
+
 // 已渲染的任务: id -> { card, bar, statusEl, doneEl, totalEl, sizeEl, logEl, streaming, aborter }
 const tasks = {};
 
@@ -541,6 +586,7 @@ async function addTask() {
     });
     if (!resp.ok) { alert("创建失败: HTTP " + resp.status); return; }
     const { task_id } = await resp.json();
+    saveForm();  // 提交成功后记住本次表单
     const t = ensureCard({ id: task_id, input: req.m3u8_input, output: req.output, status: "pending" });
     subscribe(task_id);
   } catch (e) {
@@ -600,6 +646,7 @@ $("btnAdd").addEventListener("click", addTask);
 $("btnRefresh").addEventListener("click", refresh);
 $("btnClearDone").addEventListener("click", clearDone);
 
+restoreForm();
 loadHealth();
 refresh();
 </script>

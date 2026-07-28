@@ -54,11 +54,50 @@ python3 unified_downloader.py --help
 
 Domain configuration is stored in `domain_config.{json,toml}`. The script tries TOML first (if `toml` package is installed), then falls back to JSON.
 
-## Legacy Wrapper scripts
+## Web API server (`api_server.py`)
 
-- `start_download.sh` — generic wrapper with User-Agent header
-- `missav_download.sh` — for missav.ai (proxy + Referer)
-- `7mmtv_sp_download.sh` — for 7mmtv.sx (Referer header)
+A FastAPI wrapper that exposes `m3u8_downloader` as an HTTP service with a multi-task queue and streaming progress. It **imports** `M3U8Downloader` / hooks as a library and does not modify the downloader.
+
+```bash
+pip install fastapi uvicorn        # extra deps (see requirements.txt)
+python3 api_server.py              # or: uvicorn api_server:app --host 0.0.0.0 --port 8000
+# open http://localhost:8000/
+```
+
+Endpoints:
+
+```
+POST   /api/download            — create a task, returns {task_id} (non-blocking)
+GET    /api/tasks               — list all task snapshots
+GET    /api/tasks/{id}          — single task detail
+GET    /api/tasks/{id}/stream   — NDJSON stream (application/x-ndjson, HTTP Chunked):
+                                  replays event history, then pushes live events
+POST   /api/tasks/{id}/cancel   — request cancellation (best-effort)
+DELETE /api/tasks/{id}          — remove a terminated task from the registry
+GET    /api/health              — health check + max_concurrent
+GET    /                         — serves web/index.html (StaticFiles)
+```
+
+Key design points:
+- **Concurrency**: global `ThreadPoolExecutor(max_workers=MAX_CONCURRENT)`; excess tasks wait as `pending`. Tunable via env `MAX_CONCURRENT_DOWNLOADS` (default 3).
+- **Task model**: `Task` holds status (`pending/running/done/error/cancelled`), progress, event history, subscriber queues, and a `cancel_event`. `TaskManager` owns the registry + executor.
+- **Output isolation**: each task writes to `downloads/{task_id}/`; `_safe_name()` sanitizes the basename to prevent path traversal and filename collisions between concurrent tasks.
+- **Progress**: `ProgressHook` (subclass of `BaseHook`) forwards `on_playlist_parsed / on_segment / on_segment_data / on_all_downloaded` into the task's event queue; `set_status()` broadcasts terminal states.
+- **Streaming/subscribe**: `Task.subscribe()` snapshots history and registers a queue under a lock (no lost/duplicate events); terminal state pushes a `None` sentinel to close streams. Reconnecting or opening a new tab replays history.
+- **Cancellation**: the downloader has no built-in cancel point. `CancelHook` checks `cancel_event` in segment callbacks and raises `_Cancelled(BaseException)` — deriving from `BaseException` (not `Exception`) bypasses the downloader's `except Exception` retry loop. Queued (not-yet-started) tasks are cancelled immediately via `future.cancel()`; running tasks are best-effort (in-flight segments may finish first).
+- **Note**: the task registry is in-memory; a server restart loses task records (files under `downloads/` remain).
+
+## Web UI (`web/index.html`)
+
+Single-file frontend served by `api_server.py`. Multi-task download manager:
+- Form covers all `m3u8_downloader` parameters (input, output, base_url, workers, retries, timeout, proxy, headers, key_param, no_merge/keep_temp/no_disk, and the Baidu upload options).
+- "添加下载任务" posts to `/api/download`; each task renders an independent card with its own progress bar, status badge, stats, per-task log, cancel/remove buttons.
+- Each card subscribes to `/api/tasks/{id}/stream` via `fetch` + `ReadableStream` reader, parsing NDJSON line-by-line.
+- On load, `GET /api/tasks` restores existing tasks and reconnects streams for non-terminal ones.
+- `apiUrl()` builds paths relative to the current page directory (compatible with nginx sub-path forwarding).
+- **Form memory**: on successful submit, `saveForm()` persists the form to `localStorage["m3u8_last_form"]`; `restoreForm()` refills it on next load (includes `upload_token`).
+
+## Legacy Wrapper scripts
 
 All wrappers pass `"$@"` through to `m3u8_downloader.py`.
 
