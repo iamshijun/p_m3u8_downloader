@@ -35,6 +35,14 @@
     border-left: 4px solid var(--accent);
     padding-left: 12px;
   }
+  h2 {
+    font-size: 15px;
+    color: var(--muted);
+    margin: 0 0 12px 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
   .panel {
     background: var(--panel);
     border: 1px solid var(--border);
@@ -103,13 +111,17 @@
     background: #334155;
     color: var(--text);
   }
+  button.small {
+    padding: 4px 10px;
+    font-size: 12px;
+  }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   .progress-wrap {
-    height: 20px;
+    height: 18px;
     background: #0b1220;
-    border-radius: 10px;
+    border-radius: 9px;
     overflow: hidden;
-    margin: 8px 0 14px 0;
+    margin: 6px 0;
     border: 1px solid var(--border);
   }
   .progress-bar {
@@ -119,35 +131,18 @@
     transition: width 0.2s;
     text-align: center;
     color: #0b1220;
-    font-size: 12px;
-    line-height: 20px;
+    font-size: 11px;
+    line-height: 18px;
     font-weight: 700;
   }
   .stats {
     display: flex;
-    gap: 20px;
+    gap: 16px;
     flex-wrap: wrap;
-    font-size: 13px;
+    font-size: 12px;
     color: var(--muted);
   }
   .stats b { color: var(--text); }
-  .log {
-    background: #0b1220;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 10px;
-    height: 280px;
-    overflow-y: auto;
-    font-family: "SF Mono", Consolas, monospace;
-    font-size: 12px;
-    white-space: pre-wrap;
-    word-break: break-all;
-  }
-  .log .l-info  { color: var(--text); }
-  .log .l-ok    { color: var(--ok); }
-  .log .l-warn  { color: var(--warn); }
-  .log .l-err   { color: var(--err); }
-  .log .l-dim   { color: var(--muted); }
   details summary {
     cursor: pointer;
     color: var(--muted);
@@ -161,13 +156,55 @@
     font-size: 11px;
     background: #334155;
     color: var(--text);
-    margin-left: 6px;
   }
+  .badge.pending   { background:#475569; color:#e2e8f0; }
+  .badge.running   { background:#38bdf8; color:#0b1220; }
+  .badge.done      { background:#22c55e; color:#0b1220; }
+  .badge.error     { background:#ef4444; color:#fff; }
+  .badge.cancelled { background:#f59e0b; color:#0b1220; }
+
+  /* 任务卡片 */
+  .task-card {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 12px 14px;
+    margin-bottom: 12px;
+    background: #0b1220;
+  }
+  .task-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 6px;
+  }
+  .task-title {
+    font-size: 13px;
+    color: var(--text);
+    word-break: break-all;
+    flex: 1;
+  }
+  .task-title .sub { color: var(--muted); font-size: 11px; }
+  .task-ctl { display: flex; gap: 6px; flex-shrink: 0; }
+  .task-log {
+    margin-top: 6px;
+    max-height: 140px;
+    overflow-y: auto;
+    font-family: "SF Mono", Consolas, monospace;
+    font-size: 11px;
+    color: var(--muted);
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  .task-log .l-ok  { color: var(--ok); }
+  .task-log .l-err { color: var(--err); }
+  .task-log .l-warn{ color: var(--warn); }
+  .empty { color: var(--muted); font-size: 13px; text-align: center; padding: 20px; }
 </style>
 </head>
 <body>
   <div class="container">
-    <h1>M3U8 下载器 <span class="badge" id="statusBadge">idle</span></h1>
+    <h1>M3U8 下载器 <span class="badge" id="concBadge">-</span></h1>
 
     <div class="panel">
       <div class="grid">
@@ -204,25 +241,21 @@
         </div>
 
         <div>
-          <label>临时目录 (--tmp-dir)</label>
-          <input id="tmp_dir" type="text" placeholder="不填则自动创建" />
-        </div>
-        <div>
           <label>Key 附加参数 (--key-param)</label>
           <input id="key_param" type="text" placeholder="token=xxx&sign=yyy" />
+        </div>
+        <div>
+          <label>&nbsp;</label>
+          <div class="checks" style="margin-top:0">
+            <label><input type="checkbox" id="no_merge" /> 不合并</label>
+            <label><input type="checkbox" id="keep_temp" /> 保留临时</label>
+            <label><input type="checkbox" id="no_disk" /> 不落磁盘</label>
+          </div>
         </div>
 
         <div class="full">
           <label>自定义请求头 (--header, 每行一个 Key:Value)</label>
           <textarea id="headers" placeholder="Referer: https://example.com&#10;User-Agent: Mozilla/5.0 ..."></textarea>
-        </div>
-
-        <div class="full">
-          <div class="checks">
-            <label><input type="checkbox" id="no_merge" /> 不合并 (--no-merge)</label>
-            <label><input type="checkbox" id="keep_temp" /> 保留临时目录 (--keep-temp)</label>
-            <label><input type="checkbox" id="no_disk" /> 不落磁盘 (--no-disk)</label>
-          </div>
         </div>
 
         <details class="full">
@@ -258,32 +291,23 @@
       </div>
 
       <div class="actions">
-        <button id="btnStart">开始下载</button>
-        <button id="btnStop" class="secondary" disabled>中止</button>
-        <button id="btnClear" class="secondary">清空日志</button>
+        <button id="btnAdd">添加下载任务</button>
+        <button id="btnRefresh" class="secondary">刷新列表</button>
       </div>
     </div>
 
     <div class="panel">
-      <div class="progress-wrap">
-        <div id="progressBar" class="progress-bar">0%</div>
-      </div>
-      <div class="stats">
-        <div>已完成: <b id="statDone">0</b> / <b id="statTotal">0</b></div>
-        <div>加密: <b id="statEnc">-</b></div>
-        <div>结果: <b id="statResult">-</b></div>
-        <div>大小: <b id="statSize">-</b></div>
-      </div>
-    </div>
-
-    <div class="panel">
-      <div id="log" class="log"></div>
+      <h2>
+        <span>任务列表</span>
+        <button id="btnClearDone" class="secondary small">清除已结束</button>
+      </h2>
+      <div id="taskList"></div>
+      <div id="emptyHint" class="empty">暂无任务</div>
     </div>
   </div>
 
 <script>
 const $ = id => document.getElementById(id);
-let abortCtl = null;
 
 // 计算 API 地址, 相对当前页面所在目录, 兼容 nginx 路径转发 (如 /m3u8/)
 function apiUrl(path) {
@@ -291,15 +315,8 @@ function apiUrl(path) {
   return base + path.replace(/^\//, "");
 }
 
-function log(msg, cls = "l-info") {
-  const box = $("log");
-  const line = document.createElement("div");
-  line.className = cls;
-  const t = new Date().toLocaleTimeString();
-  line.textContent = `[${t}] ${msg}`;
-  box.appendChild(line);
-  box.scrollTop = box.scrollHeight;
-}
+// 已渲染的任务: id -> { card, bar, statusEl, doneEl, totalEl, sizeEl, logEl, streaming, aborter }
+const tasks = {};
 
 function humanSize(n) {
   if (n == null) return "-";
@@ -309,20 +326,7 @@ function humanSize(n) {
   return (n / 1024 / 1024 / 1024).toFixed(2) + " GB";
 }
 
-function setStatus(text, color) {
-  const b = $("statusBadge");
-  b.textContent = text;
-  b.style.background = color || "#334155";
-  b.style.color = color ? "#0b1220" : "#e2e8f0";
-}
-
-function setProgress(done, total) {
-  const p = total > 0 ? (done / total * 100) : 0;
-  $("progressBar").style.width = p.toFixed(1) + "%";
-  $("progressBar").textContent = p.toFixed(1) + "%";
-  $("statDone").textContent = done;
-  $("statTotal").textContent = total;
-}
+const TERMINAL = new Set(["done", "error", "cancelled"]);
 
 function collectRequest() {
   const headersRaw = $("headers").value.trim();
@@ -338,14 +342,12 @@ function collectRequest() {
     retries: parseInt($("retries").value) || 3,
     timeout: parseInt($("timeout").value) || 5,
     proxy: $("proxy").value.trim() || null,
-    tmp_dir: $("tmp_dir").value.trim() || null,
     keep_temp: $("keep_temp").checked,
     headers: headers,
     key_param: $("key_param").value.trim() || null,
     no_merge: $("no_merge").checked,
     no_disk: $("no_disk").checked,
   };
-
   const upload = $("upload").value.trim();
   if (upload) {
     req.upload = upload;
@@ -357,37 +359,110 @@ function collectRequest() {
   return req;
 }
 
-async function start() {
-  const req = collectRequest();
-  if (!req.m3u8_input) {
-    alert("请输入 M3U8 URL 或路径");
-    return;
-  }
+// ---- 任务卡片渲染 --------------------------------------------------------
 
-  $("btnStart").disabled = true;
-  $("btnStop").disabled = false;
-  setStatus("running", "#38bdf8");
-  setProgress(0, 0);
-  $("statEnc").textContent = "-";
-  $("statResult").textContent = "-";
-  $("statSize").textContent = "-";
+function ensureCard(snap) {
+  let t = tasks[snap.id];
+  if (t) return t;
 
-  log("开始下载: " + req.m3u8_input, "l-info");
+  const card = document.createElement("div");
+  card.className = "task-card";
+  card.id = "task-" + snap.id;
+  card.innerHTML = `
+    <div class="task-head">
+      <div class="task-title">
+        <div class="in"></div>
+        <div class="sub"></div>
+      </div>
+      <div class="task-ctl">
+        <span class="badge status">pending</span>
+        <button class="secondary small btn-cancel">取消</button>
+        <button class="secondary small btn-remove" style="display:none">删除</button>
+      </div>
+    </div>
+    <div class="progress-wrap"><div class="progress-bar">0%</div></div>
+    <div class="stats">
+      <div>片段: <b class="done">0</b>/<b class="total">0</b></div>
+      <div>加密: <b class="enc">-</b></div>
+      <div>大小: <b class="size">-</b></div>
+      <div class="result-wrap" style="display:none">结果: <b class="result"></b></div>
+    </div>
+    <details><summary>日志</summary><div class="task-log"></div></details>
+  `;
+  $("taskList").prepend(card);
+  $("emptyHint").style.display = "none";
 
-  abortCtl = new AbortController();
+  t = {
+    id: snap.id,
+    card,
+    bar: card.querySelector(".progress-bar"),
+    statusEl: card.querySelector(".status"),
+    doneEl: card.querySelector(".done"),
+    totalEl: card.querySelector(".total"),
+    encEl: card.querySelector(".enc"),
+    sizeEl: card.querySelector(".size"),
+    resultWrap: card.querySelector(".result-wrap"),
+    resultEl: card.querySelector(".result"),
+    logEl: card.querySelector(".task-log"),
+    btnCancel: card.querySelector(".btn-cancel"),
+    btnRemove: card.querySelector(".btn-remove"),
+    streaming: false,
+    aborter: null,
+  };
+  card.querySelector(".task-title .in").textContent = snap.input || snap.id;
+  card.querySelector(".task-title .sub").textContent =
+    (snap.output || "") + "  ·  #" + snap.id;
+
+  t.btnCancel.addEventListener("click", () => cancelTask(snap.id));
+  t.btnRemove.addEventListener("click", () => removeTask(snap.id));
+
+  tasks[snap.id] = t;
+  return t;
+}
+
+function tlog(t, msg, cls = "") {
+  const line = document.createElement("div");
+  line.className = cls;
+  line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  t.logEl.appendChild(line);
+  t.logEl.scrollTop = t.logEl.scrollHeight;
+}
+
+function setStatusBadge(t, status) {
+  t.statusEl.textContent = status;
+  t.statusEl.className = "badge status " + status;
+  const terminal = TERMINAL.has(status);
+  t.btnCancel.style.display = terminal ? "none" : "";
+  t.btnRemove.style.display = terminal ? "" : "none";
+}
+
+function setProgress(t, done, total) {
+  const p = total > 0 ? (done / total * 100) : 0;
+  t.bar.style.width = p.toFixed(1) + "%";
+  t.bar.textContent = p.toFixed(1) + "%";
+  t.doneEl.textContent = done;
+  t.totalEl.textContent = total;
+}
+
+function applySnapshot(t, snap) {
+  setStatusBadge(t, snap.status);
+  setProgress(t, snap.done || 0, snap.total || 0);
+  if (snap.encrypted != null) t.encEl.textContent = snap.encrypted ? "AES-128" : "否";
+  if (snap.size != null) t.sizeEl.textContent = humanSize(snap.size);
+  if (snap.result) { t.resultWrap.style.display = ""; t.resultEl.textContent = snap.result; }
+}
+
+// ---- 事件流订阅 ----------------------------------------------------------
+
+async function subscribe(id) {
+  const t = tasks[id];
+  if (!t || t.streaming) return;
+  t.streaming = true;
+  t.aborter = new AbortController();
+
   try {
-    const resp = await fetch(apiUrl("/api/download"), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(req),
-      signal: abortCtl.signal,
-    });
-    if (!resp.ok) {
-      const text = await resp.text();
-      log("HTTP " + resp.status + ": " + text, "l-err");
-      setStatus("error", "#ef4444");
-      return;
-    }
+    const resp = await fetch(apiUrl(`/api/tasks/${id}/stream`), { signal: t.aborter.signal });
+    if (!resp.ok) { tlog(t, "订阅失败 HTTP " + resp.status, "l-err"); return; }
 
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
@@ -400,80 +475,133 @@ async function start() {
       while ((idx = buffer.indexOf("\n")) >= 0) {
         const line = buffer.slice(0, idx).trim();
         buffer = buffer.slice(idx + 1);
-        if (line) handleEvent(line);
+        if (line) handleEvent(t, line);
       }
     }
-    if (buffer.trim()) handleEvent(buffer.trim());
-
   } catch (e) {
-    if (e.name === "AbortError") {
-      log("已中止", "l-warn");
-      setStatus("aborted", "#f59e0b");
-    } else {
-      log("请求异常: " + e.message, "l-err");
-      setStatus("error", "#ef4444");
-    }
+    if (e.name !== "AbortError") tlog(t, "流异常: " + e.message, "l-err");
   } finally {
-    $("btnStart").disabled = false;
-    $("btnStop").disabled = true;
-    abortCtl = null;
+    t.streaming = false;
+    t.aborter = null;
   }
 }
 
-function handleEvent(line) {
+function handleEvent(t, line) {
   let ev;
-  try { ev = JSON.parse(line); }
-  catch (e) { log("非 JSON: " + line, "l-dim"); return; }
+  try { ev = JSON.parse(line); } catch { return; }
 
   switch (ev.type) {
-    case "connected":
-      log("已连接", "l-dim");
-      break;
+    case "connected": break;
     case "start":
-      log("任务启动 → " + ev.output, "l-info");
+      tlog(t, "任务启动 → " + ev.output);
       break;
     case "playlist":
-      log(`m3u8 已解析: 共 ${ev.total} 个片段, 加密=${ev.encrypted}`, "l-info");
-      $("statEnc").textContent = ev.encrypted ? "AES-128" : "否";
-      setProgress(0, ev.total);
+      t.encEl.textContent = ev.encrypted ? "AES-128" : "否";
+      setProgress(t, 0, ev.total);
+      tlog(t, `解析完成: ${ev.total} 片段, 加密=${ev.encrypted}`);
       break;
     case "segment":
-    case "segment_data":
-      setProgress(ev.done, ev.total);
-      // 只在关键节点打日志避免刷屏
-      if (ev.done === 1 || ev.done % 20 === 0 || ev.done === ev.total) {
-        log(`片段 ${ev.done}/${ev.total} 完成`, "l-dim");
-      }
+      setProgress(t, ev.done, ev.total);
+      if (ev.done === 1 || ev.done % 25 === 0 || ev.done === ev.total)
+        tlog(t, `片段 ${ev.done}/${ev.total}`);
       break;
     case "all_downloaded":
-      log("全部片段下载完成, 开始合并/收尾...", "l-ok");
+      tlog(t, "全部下载完成, 合并/收尾...", "l-ok");
       break;
-    case "finish":
-      log("finish hook: " + ev.result, "l-dim");
+    case "status":
+      setStatusBadge(t, ev.status);
+      if (ev.status === "done") {
+        tlog(t, "✔ 完成: " + (ev.result || "") + " (" + humanSize(ev.size) + ")", "l-ok");
+        if (ev.result) { t.resultWrap.style.display = ""; t.resultEl.textContent = ev.result; }
+        if (ev.size != null) t.sizeEl.textContent = humanSize(ev.size);
+      } else if (ev.status === "error") {
+        tlog(t, "✘ 错误: " + (ev.message || ""), "l-err");
+      } else if (ev.status === "cancelled") {
+        tlog(t, "已取消 (" + (ev.reason || "") + ")", "l-warn");
+      } else if (ev.status === "running") {
+        tlog(t, "开始运行");
+      }
       break;
-    case "done":
-      log("✔ 下载完成: " + ev.result + " (" + humanSize(ev.size) + ")", "l-ok");
-      $("statResult").textContent = ev.result;
-      $("statSize").textContent = humanSize(ev.size);
-      setStatus("done", "#22c55e");
-      break;
-    case "error":
-      log("✘ 错误: " + ev.message, "l-err");
-      setStatus("error", "#ef4444");
-      break;
-    case "heartbeat":
-      // 静默
-      break;
-    default:
-      log(JSON.stringify(ev), "l-dim");
+    case "heartbeat": break;
   }
 }
 
-$("btnStart").addEventListener("click", start);
-$("btnStop").addEventListener("click", () => {
-  if (abortCtl) abortCtl.abort();
-});
-$("btnClear").addEventListener("click", () => { $("log").innerHTML = ""; });
+// ---- 操作 ----------------------------------------------------------------
+
+async function addTask() {
+  const req = collectRequest();
+  if (!req.m3u8_input) { alert("请输入 M3U8 URL 或路径"); return; }
+
+  $("btnAdd").disabled = true;
+  try {
+    const resp = await fetch(apiUrl("/api/download"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(req),
+    });
+    if (!resp.ok) { alert("创建失败: HTTP " + resp.status); return; }
+    const { task_id } = await resp.json();
+    const t = ensureCard({ id: task_id, input: req.m3u8_input, output: req.output, status: "pending" });
+    subscribe(task_id);
+  } catch (e) {
+    alert("请求异常: " + e.message);
+  } finally {
+    $("btnAdd").disabled = false;
+  }
+}
+
+async function cancelTask(id) {
+  try {
+    await fetch(apiUrl(`/api/tasks/${id}/cancel`), { method: "POST" });
+  } catch (e) { /* ignore */ }
+}
+
+async function removeTask(id) {
+  const t = tasks[id];
+  if (t && t.aborter) t.aborter.abort();
+  try {
+    const resp = await fetch(apiUrl(`/api/tasks/${id}`), { method: "DELETE" });
+    if (!resp.ok) { alert("删除失败(任务未结束?)"); return; }
+  } catch (e) { return; }
+  if (t) t.card.remove();
+  delete tasks[id];
+  if (Object.keys(tasks).length === 0) $("emptyHint").style.display = "";
+}
+
+async function refresh() {
+  try {
+    const resp = await fetch(apiUrl("/api/tasks"));
+    const data = await resp.json();
+    for (const snap of data.tasks) {
+      const t = ensureCard(snap);
+      applySnapshot(t, snap);
+      if (!TERMINAL.has(snap.status)) subscribe(snap.id);
+    }
+  } catch (e) { /* ignore */ }
+}
+
+async function clearDone() {
+  const ids = Object.keys(tasks);
+  for (const id of ids) {
+    const t = tasks[id];
+    if (TERMINAL.has(t.statusEl.textContent)) await removeTask(id);
+  }
+}
+
+async function loadHealth() {
+  try {
+    const resp = await fetch(apiUrl("/api/health"));
+    const d = await resp.json();
+    $("concBadge").textContent = "并发上限 " + d.max_concurrent;
+  } catch { $("concBadge").textContent = "离线"; }
+}
+
+$("btnAdd").addEventListener("click", addTask);
+$("btnRefresh").addEventListener("click", refresh);
+$("btnClearDone").addEventListener("click", clearDone);
+
+loadHealth();
+refresh();
 </script>
 </body>
 </html>
