@@ -285,6 +285,12 @@
 const $ = id => document.getElementById(id);
 let abortCtl = null;
 
+// 计算 API 地址, 相对当前页面所在目录, 兼容 nginx 路径转发 (如 /m3u8/)
+function apiUrl(path) {
+  const base = location.pathname.replace(/[^/]*$/, "");  // 去掉文件名保留目录, 末尾带 /
+  return base + path.replace(/^\//, "");
+}
+
 function log(msg, cls = "l-info") {
   const box = $("log");
   const line = document.createElement("div");
@@ -370,7 +376,7 @@ async function start() {
 
   abortCtl = new AbortController();
   try {
-    const resp = await fetch("/api/download", {
+    const resp = await fetch(apiUrl("/api/download"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req),
