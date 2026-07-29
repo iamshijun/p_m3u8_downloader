@@ -309,12 +309,6 @@
 <script>
 const $ = id => document.getElementById(id);
 
-// 计算 API 地址, 相对当前页面所在目录, 兼容 nginx 路径转发 (如 /m3u8/)
-function apiUrl(path) {
-  const base = location.pathname.replace(/[^/]*$/, "");  // 去掉文件名保留目录, 末尾带 /
-  return base + path.replace(/^\//, "");
-}
-
 // ---- 表单记忆 (localStorage) --------------------------------------------
 // 需要持久化的表单字段 id
 const FORM_FIELDS = [
@@ -506,7 +500,7 @@ async function subscribe(id) {
   t.aborter = new AbortController();
 
   try {
-    const resp = await fetch(apiUrl(`/api/tasks/${id}/stream`), { signal: t.aborter.signal });
+    const resp = await fetch(`api/tasks/${id}/stream`, { signal: t.aborter.signal });
     if (!resp.ok) { tlog(t, "订阅失败 HTTP " + resp.status, "l-err"); return; }
 
     const reader = resp.body.getReader();
@@ -579,7 +573,7 @@ async function addTask() {
 
   $("btnAdd").disabled = true;
   try {
-    const resp = await fetch(apiUrl("/api/download"), {
+    const resp = await fetch("api/download", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(req),
@@ -598,7 +592,7 @@ async function addTask() {
 
 async function cancelTask(id) {
   try {
-    await fetch(apiUrl(`/api/tasks/${id}/cancel`), { method: "POST" });
+    await fetch(`api/tasks/${id}/cancel`, { method: "POST" });
   } catch (e) { /* ignore */ }
 }
 
@@ -606,7 +600,7 @@ async function removeTask(id) {
   const t = tasks[id];
   if (t && t.aborter) t.aborter.abort();
   try {
-    const resp = await fetch(apiUrl(`/api/tasks/${id}`), { method: "DELETE" });
+    const resp = await fetch(`api/tasks/${id}`, { method: "DELETE" });
     if (!resp.ok) { alert("删除失败(任务未结束?)"); return; }
   } catch (e) { return; }
   if (t) t.card.remove();
@@ -616,7 +610,7 @@ async function removeTask(id) {
 
 async function refresh() {
   try {
-    const resp = await fetch(apiUrl("/api/tasks"));
+    const resp = await fetch("api/tasks");
     const data = await resp.json();
     for (const snap of data.tasks) {
       const t = ensureCard(snap);
@@ -636,7 +630,7 @@ async function clearDone() {
 
 async function loadHealth() {
   try {
-    const resp = await fetch(apiUrl("/api/health"));
+    const resp = await fetch("api/health");
     const d = await resp.json();
     $("concBadge").textContent = "并发上限 " + d.max_concurrent;
   } catch { $("concBadge").textContent = "离线"; }
