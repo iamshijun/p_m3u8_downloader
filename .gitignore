@@ -7,3 +7,5 @@ venv
 
 .claude/
 .env
+
+nohup.log
