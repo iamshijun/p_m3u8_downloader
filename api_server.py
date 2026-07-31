@@ -247,6 +247,7 @@ class Task:
             "status": self.status,
             "input": self.req.m3u8_input,
             "output": self.result or self.req.output,
+            "upload": self.req.upload,
             "total": self.total,
             "done": self.done,
             "encrypted": self.encrypted,
