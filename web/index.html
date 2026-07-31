@@ -450,7 +450,7 @@ function ensureCard(snap) {
   };
   card.querySelector(".task-title .in").textContent = snap.input || snap.id;
   card.querySelector(".task-title .sub").textContent =
-    (snap.output || "") + "  ·  #" + snap.id;
+    (snap.upload || snap.output || "") + "  ·  #" + snap.id;
 
   t.btnCancel.addEventListener("click", () => cancelTask(snap.id));
   t.btnRemove.addEventListener("click", () => removeTask(snap.id));
@@ -581,7 +581,7 @@ async function addTask() {
     if (!resp.ok) { alert("创建失败: HTTP " + resp.status); return; }
     const { task_id } = await resp.json();
     saveForm();  // 提交成功后记住本次表单
-    const t = ensureCard({ id: task_id, input: req.m3u8_input, output: req.output, status: "pending" });
+    const t = ensureCard({ id: task_id, input: req.m3u8_input, output: req.output, upload: req.upload, status: "pending" });
     subscribe(task_id);
   } catch (e) {
     alert("请求异常: " + e.message);
