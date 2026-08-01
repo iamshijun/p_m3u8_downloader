@@ -313,17 +313,25 @@ class TaskManager:
         if task.status in TERMINAL_STATES:
             return False
         task.cancel_event.set()
-        # 若仍在队列中未开始, 可立即取消
-        if task.future is not None and task.future.cancel():
-            task.set_status("cancelled", reason="队列中取消")
-            self.remove(task_id)
+        # 尽力取消 future: PENDING 时会成功, RUNNING 时一定返回 False (会由 _run 捕获 _Cancelled 收尾)
+        if task.future is not None:
+            task.future.cancel()
+        # concurrent.futures.Future.cancel() 对 ThreadPoolExecutor 中的 future 只在 state == PENDING 时返回 True。
+        # 一旦 worker 线程把任务从队列里取出开始执行,state 变成 RUNNING,cancel() 就一定返回False。                                                                                                                                                                                                                                                                                                                                                                                     
+        # self._executor.submit(self._run, task) 之后,worker 线程取任务是毫秒级的事(从 PENDING → RUNNING 几乎没有窗口),
+        # 再加上 _run 自身也会快速 set_status("running"),等到 cancel 进来时 
+        # future 基本已经是 RUNNING,所以 cancel() 返回 False 是预期行为,不是异常
+        # 不论 future.cancel() 结果如何, 都要把状态推进到 cancelled,
+        # 否则 remove() 会因非终态而失败, 任务留在 registry 中
+        if task.status not in TERMINAL_STATES:
+            task.set_status("cancelled", reason="用户取消")
         return True
 
     def remove(self, task_id: str) -> bool:
         with self._lock:
             task = self._tasks.get(task_id)
             if not task:
-                return False
+                return True
             if task.status not in TERMINAL_STATES:
                 return False
             del self._tasks[task_id]
