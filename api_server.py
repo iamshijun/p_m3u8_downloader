@@ -316,6 +316,7 @@ class TaskManager:
         # 若仍在队列中未开始, 可立即取消
         if task.future is not None and task.future.cancel():
             task.set_status("cancelled", reason="队列中取消")
+            self.remove(task_id)
         return True
 
     def remove(self, task_id: str) -> bool:

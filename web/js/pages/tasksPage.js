@@ -70,7 +70,7 @@ async function doRemove(id) {
   taskCard.remove(id);
 }
 
-async function refresh() {
+export async function refresh() {
   try {
     const { tasks: list } = await listTasks();
     for (const snap of list) {

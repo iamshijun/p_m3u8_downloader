@@ -40,19 +40,19 @@ export async function health() {
 
 // 取消任务 (尽力而为)
 export async function cancelTask(id) {
-  return fetch(apiUrl(`api/tasks/${id}/cancel`), { method: "POST" });
+  return fetch(`api/tasks/${id}/cancel`, { method: "POST" });
 }
 
 // 删除已结束的任务
 export async function removeTask(id) {
-  return fetch(apiUrl(`api/tasks/${id}`), { method: "DELETE" });
+  return fetch(`api/tasks/${id}`, { method: "DELETE" });
 }
 
 // 订阅进度流: 返回 { response, reader, abort }
 // 调用方负责 reader.read() + 解析 NDJSON
 export function openTaskStream(id) {
   const ac = new AbortController();
-  const promise = fetch(apiUrl(`api/tasks/${id}/stream`), { signal: ac.signal });
+  const promise = fetch(`api/tasks/${id}/stream`, { signal: ac.signal });
   return {
     abort: () => ac.abort(),
     responsePromise: promise,
