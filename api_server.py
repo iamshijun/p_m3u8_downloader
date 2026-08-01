@@ -493,6 +493,7 @@ def stream_task(task_id: str) -> StreamingResponse:
                     continue
                 if item is None:
                     break
+                #通过ndjson (newline defined json) 数组通过换行的方式来表示
                 yield json.dumps(item, ensure_ascii=False) + "\n"
         finally:
             task.unsubscribe(q)

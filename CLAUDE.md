@@ -94,7 +94,6 @@ Single-file frontend served by `api_server.py`. Multi-task download manager:
 - "添加下载任务" posts to `/api/download`; each task renders an independent card with its own progress bar, status badge, stats, per-task log, cancel/remove buttons.
 - Each card subscribes to `/api/tasks/{id}/stream` via `fetch` + `ReadableStream` reader, parsing NDJSON line-by-line.
 - On load, `GET /api/tasks` restores existing tasks and reconnects streams for non-terminal ones.
-- `apiUrl()` builds paths relative to the current page directory (compatible with nginx sub-path forwarding).
 - **Form memory**: on successful submit, `saveForm()` persists the form to `localStorage["m3u8_last_form"]`; `restoreForm()` refills it on next load (includes `upload_token`).
 
 ## Legacy Wrapper scripts

@@ -1,0 +1,14 @@
+/* Design tokens: 颜色、间距、圆角等基础变量
+   改主题只需调整此处,组件样式无需变动 */
+:root {
+  --bg: #0f172a;
+  --panel: #1e293b;
+  --border: #334155;
+  --text: #e2e8f0;
+  --muted: #94a3b8;
+  --accent: #38bdf8;
+  --ok: #22c55e;
+  --err: #ef4444;
+  --warn: #f59e0b;
+  --ink: #0b1220;
+}
