@@ -40,17 +40,15 @@ function dispatch(t, ev) {
       break;
     case "status":
       taskCard.setStatus(t.id, ev.status);
+      taskCard.setTimes(t.id, ev.started_at, ev.finished_at, ev.status);
       if (ev.status === "done") {
         taskCard.log(t.id, "✔ 完成: " + (ev.result || "") + " (" + humanSize(ev.size) + ")", "l-ok");
         if (ev.result) { t.resultWrap.style.display = ""; t.resultEl.textContent = ev.result; }
         if (ev.size != null) t.sizeEl.textContent = humanSize(ev.size);
-        taskCard.stopElapsedTicker(t.id);
       } else if (ev.status === "error") {
         taskCard.log(t.id, "✘ 错误: " + (ev.message || ""), "l-err");
-        taskCard.stopElapsedTicker(t.id);
       } else if (ev.status === "cancelled") {
         taskCard.log(t.id, "已取消 (" + (ev.reason || "") + ")", "l-warn");
-        taskCard.stopElapsedTicker(t.id);
       } else if (ev.status === "running") {
         taskCard.log(t.id, "开始运行");
       }

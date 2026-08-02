@@ -128,6 +128,7 @@ function stopElapsedTicker(t) {
   if (t._elapsedTimer) {
     clearInterval(t._elapsedTimer.id);
     t._elapsedTimer = null;
+    if (snap.finished_at == null) t.finishedAtEl.textContent = fmtTime(Date.now());
   }
   if (t.elapsedEl) t.elapsedEl.classList.remove("live");
 }
@@ -193,5 +194,27 @@ export const taskCard = {
   stopElapsedTicker(id) {
     const t = tasks[id];
     if (t) stopElapsedTicker(t);
+  },
+
+  setTimes(id, started_at, finished_at, status) {
+    const t = tasks[id];
+    if (!t) return;
+    if (started_at != null) {
+      t.startedAtEl.textContent = fmtTime(started_at);
+      // 进行中: 启动 1s 刷新的实时计时器
+      if (status === "running") {
+        startElapsedTicker(t, started_at);
+      }
+    }
+    if (finished_at != null) {
+      t.finishedAtEl.textContent = fmtTime(finished_at);
+    }
+    if (status !== "running") {
+      stopElapsedTicker(t);
+      // 修正计时
+      if (finished_at != null && started_at != null) {
+        t.elapsedEl.textContent = fmtElapsed(finished_at - started_at);
+      }
+    }
   },
 };

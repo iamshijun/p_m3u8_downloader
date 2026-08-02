@@ -214,6 +214,10 @@ class Task:
         if status in TERMINAL_STATES:
             self.finished_at = time.time()
         payload = {"type": "status", "status": status}
+        if self.started_at is not None:
+            payload["started_at"] = self.started_at
+        if self.finished_at is not None:
+            payload["finished_at"] = self.finished_at
         payload.update(extra)
         self.emit(payload)
         if status in TERMINAL_STATES:

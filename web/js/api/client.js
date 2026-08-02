@@ -1,8 +1,4 @@
 // 后端 API 封装: 统一 fetch, 错误转异常
-//
-// 路径解析: 基于 document.baseURI 派生, 兼容通过 nginx /<subpath>/ 反代部署。
-// 即便当前页面从根路径访问, 派生结果仍是 /api/..., 行为不变。
-
 
 async function jsonOrThrow(resp) {
   //resp - fetch返回的Response
