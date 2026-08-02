@@ -1,0 +1,48 @@
+[Unit]
+Description=M3U8 Video Fetcher API Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__SERVICE_USER__
+Group=__SERVICE_GROUP__
+WorkingDirectory=__INSTALL_DIR__
+
+# Listen address / port / concurrency. Override via EnvironmentFile (below)
+# or edit these lines and `sudo systemctl daemon-reload`.
+Environment=HOST=0.0.0.0
+Environment=PORT=8000
+Environment=MAX_CONCURRENT_DOWNLOADS=3
+# Optional: load project .env (e.g. ACCESS_TOKEN). Leading '-' means missing
+# file is OK, not a fatal error.
+EnvironmentFile=-__INSTALL_DIR__/.env
+
+# uvicorn CLI honors $HOST/$PORT at exec time. systemd does not expand
+# variables in ExecStart, so we wrap in /bin/sh -c to get shell expansion.
+ExecStart=/bin/sh -c 'exec __PYTHON__ -m uvicorn api_server:app --host "$HOST" --port "$PORT"'
+
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+
+# systemd-managed log directory at /var/log/m3u8-downloader.
+# logrotate config (scripts/m3u8-downloader.logrotate) handles retention.
+LogsDirectory=m3u8-downloader
+LogsDirectoryMode=0750
+StandardOutput=append:/var/log/m3u8-downloader/server.log
+StandardError=inherit
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# Service must write to:
+ReadWritePaths=__INSTALL_DIR__/downloads __INSTALL_DIR__/run /var/log/m3u8-downloader
+
+# Resource limits
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

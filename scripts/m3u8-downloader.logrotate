@@ -1,0 +1,18 @@
+# /etc/logrotate.d/m3u8-downloader
+# 共享轮转策略 (由 scripts/install-systemd.sh 写入 /etc/logrotate.d/m3u8-downloader):
+#   <INSTALL_DIR>/run/server.log          -- scripts/start.sh 后台启动的日志 (开发/单机)
+#   /var/log/m3u8-downloader/server.log   -- systemd 管理的日志 (生产/服务器)
+#
+# copytruncate 让运行中的进程继续往同一路径追加写入, 不需要 SIGHUP 重打开文件
+# (uvicorn 不响应 SIGHUP, 用 copytruncate 避免依赖应用层重打开).
+
+<INSTALL_DIR>/run/server.log
+/var/log/m3u8-downloader/server.log {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
