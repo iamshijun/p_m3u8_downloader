@@ -63,6 +63,12 @@ MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
 DOWNLOAD_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
 TERMINAL_STATES = {"done", "error", "cancelled"}
 
+# 内存控制常量
+HISTORY_MAX = 200              # 每个任务保留的最大事件数（超出则丢弃旧事件）
+SUBSCRIBER_QUEUE_MAX = 200     # 每个订阅者队列的缓冲区上限（慢消费时丢弃旧事件）
+TERMINAL_TTL_SECONDS = int(os.getenv("TASK_TTL_SECONDS", "1800"))  # 已结束任务保留时间
+CLEANUP_INTERVAL = 60          # 清理线程扫描间隔（秒）
+
 
 # ---------------------------------------------------------------------------
 # 请求模型
@@ -199,13 +205,20 @@ class Task:
     # -- 事件广播 --------------------------------------------------------
 
     def emit(self, event: dict) -> None:
-        """记录事件到历史并推给所有订阅者."""
+        """记录事件到历史并推给所有订阅者.
+
+        历史有上限, 队列为有界队列; 慢消费/满队列时丢弃事件, 防止内存无限增长."""
         event.setdefault("ts", time.time())
         event["task_id"] = self.id
         with self._lock:
             self._history.append(event)
+            while len(self._history) > HISTORY_MAX:
+                self._history.pop(0)
             for q in self._subscribers:
-                q.put(event)
+                try:
+                    q.put_nowait(event)
+                except queue.Full:
+                    pass  # 消费者太慢, 丢弃该事件
 
     def set_status(self, status: str, **extra) -> None:
         self.status = status
@@ -213,6 +226,10 @@ class Task:
             self.started_at = time.time()
         if status in TERMINAL_STATES:
             self.finished_at = time.time()
+            # 任务结束后只保留最近 50 条事件用于回放和快照, 释放大部分历史内存
+            with self._lock:
+                if len(self._history) > 50:
+                    del self._history[:-50]
         payload = {"type": "status", "status": status}
         if self.started_at is not None:
             payload["started_at"] = self.started_at
@@ -226,7 +243,11 @@ class Task:
     def _close_subscribers(self) -> None:
         with self._lock:
             for q in self._subscribers:
-                q.put(None)  # sentinel
+                try:
+                    q.put_nowait(None)
+                except queue.Full:
+                    pass
+            self._subscribers.clear()  # 清空引用, 辅助 GC
 
     def subscribe(self) -> "tuple[list[dict], Optional[queue.Queue]]":
         """注册订阅者. 返回 (历史快照, 队列或None).
@@ -236,7 +257,7 @@ class Task:
             history = list(self._history)
             if self.status in TERMINAL_STATES:
                 return history, None
-            q: "queue.Queue" = queue.Queue()
+            q: "queue.Queue" = queue.Queue(maxsize=SUBSCRIBER_QUEUE_MAX)
             self._subscribers.append(q)
             return history, q
 
@@ -292,6 +313,8 @@ class TaskManager:
         self._tasks: dict[str, Task] = {}
         self._lock = threading.Lock()
         self._executor = ThreadPoolExecutor(max_workers=max_concurrent)
+        self._cleanup_thread = threading.Thread(target=self._cleanup_loop, daemon=True)
+        self._cleanup_thread.start()
 
     def create(self, req: DownloadRequest) -> Task:
         task_id = uuid.uuid4().hex[:12]
@@ -339,7 +362,27 @@ class TaskManager:
             if task.status not in TERMINAL_STATES:
                 return False
             del self._tasks[task_id]
-            return True
+        # 释放引用 辅助 GC — 必须在锁外操作避免死锁
+        task._history.clear()
+        task._subscribers.clear()
+        task.future = None
+        return True
+
+    def _cleanup_loop(self) -> None:
+        """后台线程: 定期清理超过 TTL 的已结束任务."""
+        while True:
+            time.sleep(CLEANUP_INTERVAL)
+            #保留的时间窗口,小于的任务会被清理
+            cutoff = time.time() - TERMINAL_TTL_SECONDS
+            with self._lock:
+                stale = [
+                    tid for tid, t in self._tasks.items()
+                    if t.status in TERMINAL_STATES
+                    and t.finished_at is not None
+                    and t.finished_at < cutoff
+                ]
+            for tid in stale:
+                self.remove(tid)
 
     # -- 实际下载执行 ----------------------------------------------------
 
