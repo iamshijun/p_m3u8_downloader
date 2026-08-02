@@ -142,10 +142,27 @@ class M3U8Segment:
 
 
 @dataclass
+class M3U8Variant:
+    """Master playlist 中的一个变体流 (不同清晰度/带宽)."""
+    # #...
+    # #EXT-X-STREAM-INF:BANDWIDTH=1400000,RESOLUTION=842x480
+    # 842x480/video.m3u8
+    # #EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720
+    # 1280x720/video.m3u8
+    uri: str
+    bandwidth: int = 0
+    width: Optional[int] = None
+    height: Optional[int] = None
+    codecs: Optional[str] = None
+    resolution: Optional[str] = None
+
+
+@dataclass
 class M3U8Playlist:
     """解析后的 M3U8 播放列表."""
 
     segments: list[M3U8Segment] = field(default_factory=list)
+    variants: list[M3U8Variant] = field(default_factory=list)  # master playlist 变体
     media_sequence: int = 0
     target_duration: float = 0.0
     version: int = 3
@@ -153,6 +170,11 @@ class M3U8Playlist:
     @property
     def is_encrypted(self) -> bool:
         return any(seg.key is not None for seg in self.segments)
+
+    @property
+    def is_master(self) -> bool:
+        """是否为 master playlist (含变体流列表, 无分片)."""
+        return bool(self.variants) and not self.segments
 
     def __len__(self) -> int:
         return len(self.segments)
@@ -386,6 +408,14 @@ _EXT_KEY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# 解析 #EXT-X-STREAM-INF 行内的属性 (BANDWIDTH / RESOLUTION / CODECS 等)
+## #EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720
+## 1280x720/video.m3u8
+_STREAM_INF_ATTR_RE = re.compile(
+    r'([A-Z0-9-]+)=(?:"([^"]*)"|([^,]+))',
+    re.IGNORECASE,
+)
+
 DEFAULT_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
@@ -445,6 +475,11 @@ class M3U8Downloader:
     def run(self) -> str:
         """执行完整下载流程, 返回输出文件/目录路径."""
         playlist = self._fetch_playlist()
+
+        # master playlist: 自动选择最高清晰度变体后, 重新解析其 m3u8 走正常流程
+        if playlist.is_master:
+            playlist = self._resolve_master_playlist(playlist)
+
         if not playlist.segments:
             print("[!] m3u8 文件中未找到任何视频片段")
             sys.exit(1)
@@ -540,11 +575,48 @@ class M3U8Downloader:
             with open(self.m3u8_source, "r", encoding="utf-8") as f:
                 return self._parse_playlist(f.read())
 
+    def _resolve_master_playlist(self, master: M3U8Playlist) -> M3U8Playlist:
+        """从 master playlist 选择最高清晰度变体, 拉取并解析其 m3u8."""
+        best = self._select_best_variant(master.variants)
+        if best.resolution:
+            print(f"[*] master playlist 含 {len(master.variants)} 个变体, "
+                  f"选择: {best.resolution} (带宽: {best.bandwidth})")
+        else:
+            print(f"[*] master playlist 含 {len(master.variants)} 个变体, "
+                  f"选择带宽最高: {best.bandwidth}")
+
+        # 先确保 base_url 已解析 (用于拼接变体 URI)
+        self._resolve_base_url()
+        variant_url = self._resolve_url(best.uri)
+        print(f"[*] 获取变体 m3u8: {variant_url}")
+
+        content = self.http.get_text(variant_url)
+
+        # 用变体 m3u8 内容替换 _tmp_m3u8_path (供 no-merge 模式拷贝 playlist.m3u8)
+        if self._tmp_m3u8_path and os.path.exists(self._tmp_m3u8_path):
+            try:
+                os.unlink(self._tmp_m3u8_path)
+            except OSError:
+                pass
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".m3u8", delete=False, encoding="utf-8"
+        ) as tmp:
+            tmp.write(content)
+            self._tmp_m3u8_path = tmp.name
+
+        # 更新源: 后续 _resolve_base_url 会基于变体 URL 重新推导 base_url
+        # 重置 base_url, 确保变体 m3u8 内的相对分片 URL 能正确解析到变体所在目录
+        self.m3u8_source = variant_url
+        self.base_url = None
+
+        return self._parse_playlist(content)
+
     def _parse_playlist(self, content: str) -> M3U8Playlist:
-        """解析 m3u8 文本内容."""
+        """解析 m3u8 文本内容 (支持 master playlist 的 #EXT-X-STREAM-INF)."""
         playlist = M3U8Playlist()
         current_key: Optional[KeyInfo] = None
         current_duration = 0.0
+        current_variant: Optional[M3U8Variant] = None  # master playlist 当前变体元信息
 
         for line in content.splitlines():
             line = line.strip()
@@ -559,11 +631,20 @@ class M3U8Downloader:
                 playlist.media_sequence = int(line.split(":")[1])
             elif line.startswith("#EXTINF:"):
                 current_duration = float(line.split(":")[1].rstrip(","))
-            elif line.startswith("#EXT-X-KEY"): #密钥 iv ,....
+            elif line.startswith("#EXT-X-KEY"):  # 密钥 iv ,....
                 current_key = self._parse_key_line(line)
+            elif line.startswith("#EXT-X-STREAM-INF"):
+                # master playlist: 解析变体元信息, 下一行是该变体的 m3u8 URI #各种清晰度选择 
+                current_variant = self._parse_stream_inf_line(line)
             elif not line.startswith("#"):
-                seg = M3U8Segment(uri=line, duration=current_duration, key=current_key)
-                playlist.segments.append(seg)
+                if current_variant is not None:
+                    # master playlist 中的变体 URI 行
+                    current_variant.uri = line
+                    playlist.variants.append(current_variant)
+                    current_variant = None
+                else:
+                    seg = M3U8Segment(uri=line, duration=current_duration, key=current_key)
+                    playlist.segments.append(seg)
 
         return playlist
 
@@ -587,6 +668,42 @@ class M3U8Downloader:
             )
         print(f"[!] 不支持的加密方法: {method}, 按明文处理")
         return None
+
+    @staticmethod
+    def _parse_stream_inf_line(line: str) -> M3U8Variant:
+        """解析 #EXT-X-STREAM-INF 行, 返回不含 uri 的变体 (uri 由下一行填充)."""
+        attrs: dict[str, str] = {}
+        for m in _STREAM_INF_ATTR_RE.finditer(line):
+            key = m.group(1).upper()
+            attrs[key] = m.group(2) if m.group(2) is not None else m.group(3).strip()
+
+        bandwidth = int(attrs.get("BANDWIDTH", "0") or 0)
+        resolution = attrs.get("RESOLUTION")
+        width = height = None
+        if resolution and "x" in resolution:
+            parts = resolution.lower().split("x")
+            if len(parts) == 2:
+                try:
+                    width, height = int(parts[0]), int(parts[1])
+                except ValueError:
+                    pass
+
+        return M3U8Variant(
+            uri="",
+            bandwidth=bandwidth,
+            width=width,
+            height=height,
+            codecs=attrs.get("CODECS"),
+            resolution=resolution,
+        )
+
+    @staticmethod
+    def _select_best_variant(variants: list[M3U8Variant]) -> M3U8Variant:
+        """选择最佳变体: 优先按分辨率像素数, 其次按带宽."""
+        def sort_key(v: M3U8Variant) -> tuple[int, int]:
+            pixels = (v.width or 0) * (v.height or 0)
+            return (pixels, v.bandwidth)
+        return max(variants, key=sort_key)
 
     # -- base_url ------------------------------------------------------------
 

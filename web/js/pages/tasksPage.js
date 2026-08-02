@@ -58,6 +58,7 @@ async function addTask() {
 }
 
 async function doCancel(id) {
+  if (!confirm("确定要取消吗?")) return;
   try { await cancelTask(id); } catch (e) { /* ignore */ }
 }
 
