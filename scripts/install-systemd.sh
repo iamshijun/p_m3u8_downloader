@@ -60,11 +60,15 @@ if [[ ! -f "$INSTALL_DIR/api_server.py" ]]; then
 fi
 INSTALL_DIR="$(cd "$INSTALL_DIR" && pwd)"
 
-# 解析 python
+# 解析 python (优先级: --python=参数 > VIRTUAL_ENV 环境变量 > 系统 python3)
 if [[ -z "$PYTHON_BIN" ]]; then
-    PYTHON_BIN="$(command -v python3 || true)"
+    if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+        PYTHON_BIN="$VIRTUAL_ENV/bin/python"
+    else
+        PYTHON_BIN="$(command -v python3 || true)"
+    fi
     if [[ -z "$PYTHON_BIN" ]]; then
-        echo "找不到 python3" >&2
+        echo "找不到 python3 (可用 --python= 指定路径或激活 venv)" >&2
         exit 1
     fi
 fi

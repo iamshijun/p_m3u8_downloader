@@ -9,7 +9,7 @@
 #   HOST           监听地址, 默认 0.0.0.0
 #   PORT           监听端口, 默认 8000
 #   MAX_CONCURRENT 同时运行的下载任务数, 默认 3 (传给 MAX_CONCURRENT_DOWNLOADS)
-#   PYTHON         Python 解释器, 默认 python3
+#   PYTHON         Python 解释器. 优先级: 环境变量 PYTHON > 当前激活的 venv > python3
 #
 # 文件:
 #   run/server.pid   进程 ID
@@ -25,7 +25,17 @@ LOG_FILE="$PROJECT_DIR/run/server.log"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8000}"
 MAX_CONCURRENT="${MAX_CONCURRENT:-3}"
-PYTHON="${PYTHON:-python3}"
+# Python 解释器选择优先级:
+#   1. 显式设置的环境变量 PYTHON
+#   2. 当前激活的 venv (VIRTUAL_ENV 环境变量的路径)
+#   3. 系统默认 python3
+if [[ -n "${PYTHON:-}" ]]; then
+    :  # 已显式设定, 不做覆盖
+elif [[ -n "${VIRTUAL_ENV:-}" ]]; then
+    PYTHON="$VIRTUAL_ENV/bin/python"
+else
+    PYTHON="python3"
+fi
 
 mkdir -p "$PROJECT_DIR/run"
 
@@ -68,7 +78,7 @@ fi
 
 # 依赖检查
 if ! "$PYTHON" -c "import fastapi, uvicorn" 2>/dev/null; then
-    echo "缺少依赖 fastapi/uvicorn, 请先执行: pip install -r requirements.txt" >&2
+    echo "缺少依赖 fastapi/uvicorn, 请先执行: $PYTHON -m pip install -r requirements.txt" >&2
     exit 1
 fi
 

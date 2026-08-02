@@ -32,6 +32,11 @@ function ensureCard(snap) {
       <div>大小: <b class="size">-</b></div>
       <div class="result-wrap" style="display:none">结果: <b class="result"></b></div>
     </div>
+    <div class="times">
+      <div>开始: <b class="started-at">-</b></div>
+      <div>结束: <b class="finished-at">-</b></div>
+      <div>耗时: <b class="elapsed">-</b></div>
+    </div>
     <details><summary>日志</summary><div class="task-log"></div></details>
   `;
   $("taskList").prepend(card);
@@ -48,6 +53,9 @@ function ensureCard(snap) {
     sizeEl: card.querySelector(".size"),
     resultWrap: card.querySelector(".result-wrap"),
     resultEl: card.querySelector(".result"),
+    startedAtEl: card.querySelector(".started-at"),
+    finishedAtEl: card.querySelector(".finished-at"),
+    elapsedEl: card.querySelector(".elapsed"),
     logEl: card.querySelector(".task-log"),
     btnCancel: card.querySelector(".btn-cancel"),
     btnRemove: card.querySelector(".btn-remove"),
@@ -84,12 +92,72 @@ function setProgress(t, done, total) {
   t.totalEl.textContent = total;
 }
 
+function fmtTime(ts) {
+  if (ts == null) return "-";
+  const d = new Date(ts * 1000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function fmtElapsed(sec) {
+  if (sec == null || sec < 0) return "-";
+  if (sec < 1) return (sec * 1000).toFixed(0) + " ms";
+  if (sec < 60) return sec.toFixed(1) + " 秒";
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60);
+  if (m < 60) return `${m}分${s}秒`;
+  const h = Math.floor(m / 60);
+  return `${h}小时${m % 60}分${s}秒`;
+}
+
+function startElapsedTicker(t, startedAt) {
+  if (t._elapsedTimer) {
+    if (t._elapsedTimer.startedAt === startedAt) return;
+    clearInterval(t._elapsedTimer.id);
+  }
+  t.elapsedEl.classList.add("live");
+  const id = setInterval(() => {
+    if (t.card.isConnected) {
+      t.elapsedEl.textContent = fmtElapsed(Date.now() / 1000 - startedAt);
+    }
+  }, 1000);
+  t._elapsedTimer = { id, startedAt };
+}
+
+function stopElapsedTicker(t) {
+  if (t._elapsedTimer) {
+    clearInterval(t._elapsedTimer.id);
+    t._elapsedTimer = null;
+  }
+  if (t.elapsedEl) t.elapsedEl.classList.remove("live");
+}
+
+function setTimes(t, snap) {
+  if (snap.started_at != null) t.startedAtEl.textContent = fmtTime(snap.started_at);
+  if (snap.finished_at != null) t.finishedAtEl.textContent = fmtTime(snap.finished_at);
+  if (snap.started_at != null) {
+    if (snap.status === "running") {
+      // 进行中: 启动 1s 刷新, 直接读浏览器本地时间避免时钟偏差
+      startElapsedTicker(t, snap.started_at);
+    } else {
+      // 已结束: 静态显示
+      stopElapsedTicker(t);
+      if (snap.finished_at != null) {
+        t.elapsedEl.textContent = fmtElapsed(snap.finished_at - snap.started_at);
+      }
+    }
+  } else {
+    stopElapsedTicker(t);
+  }
+}
+
 function applySnapshot(t, snap) {
   setStatusBadge(t, snap.status);
   setProgress(t, snap.done || 0, snap.total || 0);
   if (snap.encrypted != null) t.encEl.textContent = snap.encrypted ? "AES-128" : "否";
   if (snap.size != null) t.sizeEl.textContent = humanSize(snap.size);
   if (snap.result) { t.resultWrap.style.display = ""; t.resultEl.textContent = snap.result; }
+  setTimes(t, snap);
 }
 
 // 公共 API
@@ -115,10 +183,15 @@ export const taskCard = {
 
   remove(id) {
     const t = tasks[id];
-    if (t) { t.card.remove(); delete tasks[id]; }
+    if (t) { stopElapsedTicker(t); t.card.remove(); delete tasks[id]; }
     if (Object.keys(tasks).length === 0) $("emptyHint").style.display = "";
   },
 
   has(id) { return !!tasks[id]; },
   isTerminal(id) { return TERMINAL.has(tasks[id].statusEl.textContent); },
+
+  stopElapsedTicker(id) {
+    const t = tasks[id];
+    if (t) stopElapsedTicker(t);
+  },
 };

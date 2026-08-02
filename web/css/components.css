@@ -50,6 +50,21 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 .stats b { color: var(--text); }
 
+/* 时间行 (开始/结束/耗时) */
+.times {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  color: var(--muted);
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+  font-variant-numeric: tabular-nums;
+}
+.times b { color: var(--text); }
+.times .elapsed.live { color: #38bdf8; }
+
 /* 状态徽章 */
 .badge {
   display: inline-block;
