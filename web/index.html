@@ -96,6 +96,7 @@
 
       <div class="actions">
         <button id="btnAdd">添加下载任务</button>
+        <button id="btnImport" class="secondary">批量导入</button>
         <button id="btnRefresh" class="secondary">刷新列表</button>
       </div>
     </div>
@@ -107,6 +108,26 @@
       </h2>
       <div id="taskList"></div>
       <div id="emptyHint" class="empty">暂无任务</div>
+    </div>
+  </div>
+
+  <!-- 批量导入弹窗 -->
+  <div class="modal-mask" id="importModal" style="display:none">
+    <div class="modal">
+      <h3>批量导入任务</h3>
+      <p class="hint">每行一个任务，格式：<code>文件名 URL</code>（空格分隔）。其余参数沿用当前表单设置。</p>
+      <div class="modal-toolbar">
+        <button type="button" class="secondary small" id="btnImportFile">选择 .txt 文件</button>
+        <input type="file" id="importFile" accept=".txt,text/plain" style="display:none" />
+        <span class="preview" id="importPreview"></span>
+      </div>
+      <textarea id="importText" placeholder="movie1 https://example.com/1.m3u8&#10;movie2 https://example.com/2.m3u8" style="min-height:160px"></textarea>
+      <div class="modal-errors" id="importErrors" style="display:none"></div>
+      <div class="modal-result" id="importResult" style="display:none"></div>
+      <div class="actions">
+        <button id="btnImportOk">导入</button>
+        <button id="btnImportCancel" class="secondary">取消</button>
+      </div>
     </div>
   </div>
 

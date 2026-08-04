@@ -118,3 +118,71 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .task-log .l-ok  { color: var(--ok); }
 .task-log .l-err { color: var(--err); }
 .task-log .l-warn{ color: var(--warn); }
+
+/* 模态框 */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.modal {
+  width: min(640px, 92vw);
+  max-height: 86vh;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+}
+.modal h3 {
+  margin: 0 0 8px 0;
+  font-size: 16px;
+  color: var(--text);
+}
+.modal .hint {
+  font-size: 12px;
+  color: var(--muted);
+  margin: 0 0 10px 0;
+}
+.modal .hint code {
+  background: var(--ink);
+  padding: 1px 5px;
+  border-radius: 3px;
+}
+.modal-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.modal-toolbar .preview { font-size: 12px; color: var(--muted); }
+.modal-errors {
+  margin-top: 8px;
+  max-height: 120px;
+  overflow-y: auto;
+  font-size: 12px;
+  color: var(--err);
+  background: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+.modal-result {
+  margin-top: 8px;
+  max-height: 180px;
+  overflow-y: auto;
+  font-size: 12px;
+  background: var(--ink);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 8px 10px;
+}
+.modal-result .ok   { color: var(--ok); }
+.modal-result .warn { color: var(--warn); }
+.modal-result .err  { color: var(--err); }

@@ -7,6 +7,7 @@
 
 接口:
     POST   /api/download              → 创建下载任务, 返回 {task_id}
+    POST   /api/download/batch        → 批量创建下载任务, 返回 {created, skipped, errors}
     GET    /api/tasks                 → 列出所有任务 (状态快照)
     GET    /api/tasks/{id}            → 单个任务详情
     GET    /api/tasks/{id}/stream     → StreamingResponse(NDJSON) 订阅进度 (先回放历史再实时)
@@ -62,6 +63,7 @@ from m3u8_downloader import (
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
 DOWNLOAD_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
 TERMINAL_STATES = {"done", "error", "cancelled"}
+BATCH_LIMIT = int(os.getenv("BATCH_LIMIT", "500"))   # 单次批量导入的任务上限
 
 # 内存控制常量
 HISTORY_MAX = 200              # 每个任务保留的最大事件数（超出则丢弃旧事件）
@@ -98,6 +100,17 @@ class DownloadRequest(BaseModel):
     upload_ondup: str = Field("overwrite", description="冲突策略: fail/overwrite/newcopy")
     upload_retries: int = Field(5, description="上传重试次数")
     upload_delete: bool = Field(True, description="上传成功后是否删除本地分片")
+
+
+class BatchDownloadRequest(BaseModel):
+    """批量下载请求: tasks 为若干 DownloadRequest 字段的 JSON 对象.
+
+    每个任务必填 m3u8_input / output; 其余字段为前端合并后的表单配置.
+    使用 dict 而非 DownloadRequest, 以便逐条单独校验、跳过非法项, 而不至于整批 422.
+    可选携带 line (原始行号), 仅用于错误/跳过明细回显, 不会传给 DownloadRequest.
+    """
+
+    tasks: list[dict] = Field(..., min_length=1, description="要批量创建的任务列表")
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +346,14 @@ class TaskManager:
             tasks = list(self._tasks.values())
         return [t.snapshot() for t in sorted(tasks, key=lambda t: t.created_at, reverse=True)]
 
+    def registered_io_keys(self) -> "tuple[set[str], set[str]]":
+        """返回当前注册表中所有任务的 (URL 集合, 规范化文件名集合), 用于批量去重."""
+        with self._lock:
+            tasks = list(self._tasks.values())
+        urls = {t.req.m3u8_input.strip() for t in tasks}
+        names = {_safe_name(t.req.output) for t in tasks}
+        return urls, names
+
     def cancel(self, task_id: str) -> bool:
         task = self.get(task_id)
         if not task:
@@ -492,6 +513,59 @@ def download(req: DownloadRequest) -> dict:
     """创建下载任务, 立即返回 task_id (不阻塞)."""
     task = manager.create(req)
     return {"task_id": task.id, "status": task.status}
+
+
+@app.post("/api/download/batch")
+def download_batch(req: BatchDownloadRequest) -> dict:
+    """批量创建下载任务: 逐个校验 + 去重后创建.
+
+    去重规则: URL 或 规范化后的文件名 与本次批量内或当前注册表中仍在的任务重复 → 跳过.
+    非法项(缺 URL/文件名、参数校验失败、超出 BATCH_LIMIT)计入 errors, 合法项照常创建.
+    返回 {"created": [...], "skipped": [...], "errors": [...]}.
+    """
+    created: list[dict] = []
+    skipped: list[dict] = []
+    errors: list[dict] = []
+    seen_urls, seen_names = manager.registered_io_keys()
+
+    for i, raw in enumerate(req.tasks, start=1):
+        if i > BATCH_LIMIT:
+            errors.append({"line": i, "reason": f"超出单次导入上限 {BATCH_LIMIT}"})
+            continue
+        item = dict(raw)
+        line_no = item.pop("line", i)
+        url = str(item.get("m3u8_input") or "").strip()
+        #upload path
+        name = str(item.get("upload") or "").strip()
+
+        if not url:
+            errors.append({"line": line_no, "reason": "缺少 URL"})
+            continue
+        if not name:
+            errors.append({"line": line_no, "reason": "缺少文件名", "input": url})
+            continue
+        if url in seen_urls:
+            skipped.append({"line": line_no, "reason": "URL 重复", "input": url})
+            continue
+        name_key = name #_safe_name(name) FIXME 
+        if name_key in seen_names:
+            skipped.append({"line": line_no, "reason": "文件名重复", "upload": name})
+            continue
+
+        item["m3u8_input"] = url
+        item["upload"] = name
+        try:
+            task_req = DownloadRequest(**item)
+        except Exception as e:
+            errors.append({"line": line_no, "reason": f"参数校验失败: {e}", "input": url})
+            continue
+
+        seen_urls.add(url)
+        seen_names.add(name_key)
+        task = manager.create(task_req)
+        created.append({"task_id": task.id, "m3u8_input": url, "upload": name})
+
+    return {"created": created, "skipped": skipped, "errors": errors}
 
 
 @app.get("/api/tasks")

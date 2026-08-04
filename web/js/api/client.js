@@ -22,6 +22,17 @@ export async function createTask(req) {
   return jsonOrThrow(resp);
 }
 
+// 批量创建下载任务: tasks 为 DownloadRequest 字段的对象数组
+// 返回 { created: [{task_id, m3u8_input, output}], skipped: [...], errors: [...] }
+export async function createBatchTasks(tasks) {
+  const resp = await fetch("api/download/batch", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ tasks }),
+  });
+  return jsonOrThrow(resp);
+}
+
 // 任务列表快照
 export async function listTasks() {
   const resp = await fetch("api/tasks");

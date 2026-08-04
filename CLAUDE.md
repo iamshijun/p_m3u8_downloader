@@ -68,6 +68,10 @@ Endpoints:
 
 ```
 POST   /api/download            — create a task, returns {task_id} (non-blocking)
+POST   /api/download/batch      — batch create tasks, returns {created, skipped, errors}:
+                                 dedupes by URL / sanitized output filename against the
+                                 current registry + the batch itself; malformed entries
+                                 land in errors (per-line, with optional `line` echoed back)
 GET    /api/tasks               — list all task snapshots
 GET    /api/tasks/{id}          — single task detail
 GET    /api/tasks/{id}/stream   — NDJSON stream (application/x-ndjson, HTTP Chunked):
