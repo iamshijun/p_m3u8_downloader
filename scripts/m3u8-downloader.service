@@ -43,6 +43,10 @@ ReadWritePaths=__INSTALL_DIR__/downloads __INSTALL_DIR__/run /var/log/m3u8-downl
 
 # Resource limits
 LimitNOFILE=65535
+# 内存硬上限 + 高水位软提示: 软限触发回收, 硬限触发 OOM kill 由 systemd 控制
+# (而不是被内核 OOM killer 误杀), 然后 Restart=on-failure 自动拉起, 顺便规避 pymalloc 碎片化
+MemoryHigh=500M
+MemoryMax=1G
 
 [Install]
 WantedBy=multi-user.target

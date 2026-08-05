@@ -29,6 +29,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import json
 import os
 import queue
@@ -40,7 +42,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -64,6 +66,7 @@ MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
 DOWNLOAD_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
 TERMINAL_STATES = {"done", "error", "cancelled"}
 BATCH_LIMIT = int(os.getenv("BATCH_LIMIT", "500"))   # 单次批量导入的任务上限
+MAX_REGISTRY = int(os.getenv("MAX_REGISTRY", "2000"))  # 任务注册表最大条目数, 超过时按 finished_at 驱逐最旧
 
 # 内存控制常量
 HISTORY_MAX = 200              # 每个任务保留的最大事件数（超出则丢弃旧事件）
@@ -252,6 +255,9 @@ class Task:
         self.emit(payload)
         if status in TERMINAL_STATES:
             self._close_subscribers()
+            # 终态时立即释放 future 引用, 让 _run 帧和 downloader 对象可以被 GC 回收
+            # 否则 future 会一直保留 _run 帧(含 M3U8Downloader / 解析后的 playlist 等)直到 TTL 清理
+            self.future = None
 
     def _close_subscribers(self) -> None:
         with self._lock:
@@ -390,9 +396,12 @@ class TaskManager:
         return True
 
     def _cleanup_loop(self) -> None:
-        """后台线程: 定期清理超过 TTL 的已结束任务."""
+        """后台线程: 定期清理超过 TTL 的已结束任务 + size cap 驱逐 + 显式 GC."""
         while True:
             time.sleep(CLEANUP_INTERVAL)
+            # 显式触发循环 GC, 打破 task <-> future <-> _run 帧 之间的循环引用
+            # (set_status 终态已释放 future, 这里兜底处理其他潜在循环)
+            gc.collect()
             #保留的时间窗口,小于的任务会被清理
             cutoff = time.time() - TERMINAL_TTL_SECONDS
             with self._lock:
@@ -402,6 +411,16 @@ class TaskManager:
                     and t.finished_at is not None
                     and t.finished_at < cutoff
                 ]
+                # size cap: 即使 TTL 未到, 总量超限也按 finished_at 驱逐最旧的终态任务
+                if len(self._tasks) > MAX_REGISTRY:
+                    terminal_sorted = sorted(
+                        [(tid, t) for tid, t in self._tasks.items() if t.status in TERMINAL_STATES],
+                        key=lambda x: x[1].finished_at or 0,
+                    )
+                    excess = len(self._tasks) - MAX_REGISTRY
+                    for tid, _ in terminal_sorted[:excess]:
+                        if tid not in stale:
+                            stale.append(tid)
             for tid in stale:
                 self.remove(tid)
 
@@ -609,7 +628,7 @@ def delete_task(task_id: str) -> dict:
 
 
 @app.get("/api/tasks/{task_id}/stream")
-def stream_task(task_id: str) -> StreamingResponse:
+async def stream_task(task_id: str, request: Request) -> StreamingResponse:
     """订阅任务进度: 先回放历史事件, 再实时推送 (NDJSON, HTTP Chunked)."""
     task = manager.get(task_id)
     if not task:
@@ -617,7 +636,7 @@ def stream_task(task_id: str) -> StreamingResponse:
 
     history, q = task.subscribe()
 
-    def event_stream():
+    async def event_stream():
         yield json.dumps({"type": "connected", "task_id": task_id, "ts": time.time()}, ensure_ascii=False) + "\n"
         # 回放历史
         for ev in history:
@@ -627,10 +646,13 @@ def stream_task(task_id: str) -> StreamingResponse:
             return
         try:
             while True:
+                # 检测客户端断开, 主动退出避免 finally 迟迟不执行导致 queue 泄漏
+                if await request.is_disconnected():
+                    break
                 try:
-                    item = q.get(timeout=15)
+                    item = q.get_nowait()
                 except queue.Empty:
-                    yield json.dumps({"type": "heartbeat", "ts": time.time()}) + "\n"
+                    await asyncio.sleep(1)
                     continue
                 if item is None:
                     break

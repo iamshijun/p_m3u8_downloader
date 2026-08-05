@@ -20,10 +20,12 @@ import io
 import json
 import os
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -120,12 +122,26 @@ def _clear_progress(local_dir: Path) -> None:
 
 # ── Upload logic ───────────────────────────────────────────────────────────
 
+# 模块级 httpx.Client 单例: 复用底层连接池, 避免每次调用都创建/销毁 client
+# httpx.Client 是线程安全的, 可在 ThreadPoolExecutor 的多个 worker 间共享
+_http_client: Optional[httpx.Client] = None
+_http_client_lock = threading.Lock()
+
+
+def _get_http_client() -> httpx.Client:
+    """懒加载并返回全局 httpx.Client 单例."""
+    global _http_client
+    if _http_client is None:
+        with _http_client_lock:
+            if _http_client is None:
+                _http_client = httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0))
+    return _http_client
+
 
 def _do_upload_raw(local_path: Path, remote_path: str, token: str, ondup: str) -> dict:
     """Upload a single file (no retry, no logging).  Raise on failure."""
-    
     with open(local_path, "rb") as fh:
-        response = httpx.post(
+        response = _get_http_client().post(
             UPLOAD_URL,
             params={
                 "method": "upload",
@@ -135,7 +151,6 @@ def _do_upload_raw(local_path: Path, remote_path: str, token: str, ondup: str) -
                 "rtype": 3,
             },
             files={"file": (local_path.name, fh, "application/octet-stream")},
-            timeout=httpx.Timeout(600.0, connect=30.0),
         )
     #response.raise_for_status()
     if response.status_code != 200:
@@ -251,7 +266,7 @@ def upload_file(
 # 供外部使用 非cli独立运行的时候使用
 def _do_upload_bytes(data: bytes, filename: str, remote_path: str, token: str, ondup: str) -> dict:
     """Upload raw bytes as a file (no retry, no logging).  Raise on failure."""
-    response = httpx.post(
+    response = _get_http_client().post(
         UPLOAD_URL,
         params={
             "method": "upload",
@@ -261,7 +276,6 @@ def _do_upload_bytes(data: bytes, filename: str, remote_path: str, token: str, o
             "rtype": 3,
         },
         files={"file": (filename, io.BytesIO(data), "application/octet-stream")},
-        timeout=httpx.Timeout(600.0, connect=30.0),
     )
     #response.raise_for_status()
     if response.status_code != 200:
