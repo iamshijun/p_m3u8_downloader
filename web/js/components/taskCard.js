@@ -124,11 +124,11 @@ function startElapsedTicker(t, startedAt) {
   t._elapsedTimer = { id, startedAt };
 }
 
-function stopElapsedTicker(t) {
+function stopElapsedTicker(t, finishedAt = null) {
   if (t._elapsedTimer) {
     clearInterval(t._elapsedTimer.id);
     t._elapsedTimer = null;
-    if (snap.finished_at == null) t.finishedAtEl.textContent = fmtTime(Date.now());
+    if (finishedAt == null) t.finishedAtEl.textContent = fmtTime(Date.now());
   }
   if (t.elapsedEl) t.elapsedEl.classList.remove("live");
 }
@@ -142,7 +142,7 @@ function setTimes(t, snap) {
       startElapsedTicker(t, snap.started_at);
     } else {
       // 已结束: 静态显示
-      stopElapsedTicker(t);
+      stopElapsedTicker(t, snap.finished_at);
       if (snap.finished_at != null) {
         t.elapsedEl.textContent = fmtElapsed(snap.finished_at - snap.started_at);
       }
@@ -210,7 +210,7 @@ export const taskCard = {
       t.finishedAtEl.textContent = fmtTime(finished_at);
     }
     if (status !== "running") {
-      stopElapsedTicker(t);
+      stopElapsedTicker(t, finished_at);
       // 修正计时
       if (finished_at != null && started_at != null) {
         t.elapsedEl.textContent = fmtElapsed(finished_at - started_at);
