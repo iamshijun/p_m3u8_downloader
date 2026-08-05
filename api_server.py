@@ -451,6 +451,17 @@ class TaskManager:
                     task.error = "upload 需要 upload_token 或 .env ACCESS_TOKEN"
                     task.set_status("error", message=task.error)
                     return
+                # 下载前预检: 通过 /api/quota 验证 access_token (errno=6 = 身份认证失败),
+                # 失败立即终止, 避免浪费带宽下载一堆分片后再发现 token 失效.
+                task.emit({"type": "preflight", "upload": req.upload})
+                try:
+                    from pan_upload import preflight_check
+                    info = preflight_check(token=token)
+                    task.emit({"type": "preflight_ok", "upload": req.upload, **info})
+                except Exception as e:
+                    task.error = f"云盘预检失败: {e}"
+                    task.set_status("error", message=task.error, stage="preflight")
+                    return
                 hooks.append(YunpanUploadHook(
                     token=token,
                     remote_prefix=req.upload,

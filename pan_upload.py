@@ -319,6 +319,60 @@ def upload_bytes(
     )
 
 
+# ── Preflight check ────────────────────────────────────────────────────────
+
+# Baidu quota API: 用户级接口, 仅用于验 access_token + 顺手拿到配额信息.
+# errno 6 表示 access_token 无效 (身份认证失败), 比较明确.
+QUOTA_URL = "https://pan.baidu.com/api/quota"
+
+
+def preflight_check(token: str, timeout: float = 10.0) -> dict:
+    """Pre-flight check: validate Baidu access_token via the quota API.
+
+    Calls ``GET /api/quota`` (a lightweight, non-destructive user-info call)
+    to confirm the access_token is still valid. errno 6 indicates
+    authentication failure; any other non-zero errno is also surfaced with
+    its ``errmsg``.
+
+    Designed to be called *before* starting a long-running m3u8 download, so
+    we fail fast on an expired / invalid token instead of downloading hundreds
+    of segments that we can never upload. 后续的上传会自己创建目标目录, 本函数
+    不再做任何路径相关的检查 / 写入.
+
+    No retry: a failed check should propagate immediately so the caller can
+    abort the download.
+
+    Returns:
+        A small dict with the API response on success. Raises on failure.
+    """
+    if not token:
+        raise ValueError("token 不能为空")
+
+    resp = httpx.get(
+        QUOTA_URL,
+        params={
+            "checkexpire": 1,
+            "checkfree": 1,
+            "access_token": token,
+        },
+        timeout=timeout,
+    )
+    resp.raise_for_status()
+    result: dict = resp.json()
+    errno = result.get("errno")
+    if errno in (0, None):
+        return {
+            "errno": 0,
+            "total": result.get("total"), #int: 总空间大小，单位B
+            "used": result.get("used"), #int: 已使用大小，单位B
+            "free": result.get("free"), # int: 免费容量，单位B
+            "expire": result.get("expire"),#bool: 7天内是否有容量到期
+        }
+    # errno=6 表示认证失败  (reference: https://pan.baidu.com/union/doc/%E5%B9%B3%E5%8F%B0%E7%AE%80%E4%BB%8B/%E9%94%99%E8%AF%AF%E7%A0%81/)
+    errmsg = result.get("errmsg", "unknown")
+    raise RuntimeError(f"云盘预检失败 (errno={errno} {errmsg})")
+
+
 # ── Directory upload ───────────────────────────────────────────────────────
 
 def upload_directory(
