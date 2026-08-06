@@ -460,6 +460,7 @@ class TaskManager:
                     merge=not no_merge,
                     keep_temp=req.keep_temp,
                     tmp_dir=tmp_dir,
+                    quiet=True,
                 ),
                 ProgressHook(task),
             ]
@@ -503,6 +504,7 @@ class TaskManager:
                 hooks=hooks,
                 key_param=req.key_param,
                 key_format=req.key_format,
+                quiet=True,
             )
 
             result = downloader.run()

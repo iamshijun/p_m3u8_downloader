@@ -51,19 +51,28 @@ except ImportError:
 class ProgressBar:
     """进度条管理器：统一封装 tqdm 和 print 的逻辑."""
 
-    def __init__(self, total: Optional[int] = None, desc: str = "", unit: str = "item"):
+    def __init__(
+        self,
+        total: Optional[int] = None,
+        desc: str = "",
+        unit: str = "item",
+        quiet: bool = False,
+    ):
         """初始化进度条.
 
         Args:
             total: 总数，None 表示不确定
             desc: 描述文本
             unit: 单位
+            quiet: 静默模式 (即使安装了 tqdm 也不使用), 适用于 API 调用场景,
+                   此时进度由 hook 上报, 避免日志噪声.
         """
         self.total = total
         self.desc = desc
         self.unit = unit
+        self.quiet = quiet
         self.pbar = None
-        self.use_pbar = HAS_TQDM and total is not None
+        self.use_pbar = (not quiet) and HAS_TQDM and total is not None
 
     def __enter__(self):
         """支持 with 语法."""
@@ -115,6 +124,30 @@ class ProgressBar:
             进度字符串，如 "进度: 10/20"
         """
         return f"{desc}: {current}/{total}"
+
+    def log_progress(self, current: int, total: int, success: int = 0, fail: int = 0) -> None:
+        """按阈值输出文本进度日志 (仅在非 tqdm 模式下生效).
+
+        阈值: 每 100 个片段一次, 加上最后一次 (完成时).
+
+        Args:
+            current: 已完成的片段数
+            total: 总片段数
+            success: 成功数
+            fail: 失败数
+        """
+        if self.use_pbar:
+            # tqdm 正在显示, 不重复输出
+            return
+        if current % 100 != 0 and current != total:
+            return
+        if self.quiet:
+            # 静默模式: 粗粒度, 不暴露成功/失败细节
+            self.write(f"  片段 {current}/{total}")
+        else:
+            self.write(
+                f"  [*] 进度: {current}/{total} (成功: {success}, 失败: {fail})"
+            )
 
 # ---------------------------------------------------------------------------
 # Domain objects
@@ -276,11 +309,13 @@ class SegmentMergeHook(BaseHook):
         merge: bool = True,
         keep_temp: bool = False,
         tmp_dir: Optional[str] = None,
+        quiet: bool = False,
     ):
         self.output = output
         self.merge = merge
         self.keep_temp = keep_temp
         self.tmp_dir = tmp_dir
+        self.quiet = quiet
 
     def on_all_downloaded(self, playlist: M3U8Playlist, tmp_dir: str) -> None:
         if self.merge:
@@ -292,7 +327,7 @@ class SegmentMergeHook(BaseHook):
         """按顺序合并片段."""
         print(f"[*] 合并片段到: {self.output}")
 
-        with ProgressBar(total=total, desc="合并进度", unit="seg") as pbar:
+        with ProgressBar(total=total, desc="合并进度", unit="seg", quiet=self.quiet) as pbar:
             with open(self.output, "wb") as outfile:
                 for i in range(total):
                     path = os.path.join(tmp_dir, f"seg_{i:06d}")
@@ -447,6 +482,7 @@ class M3U8Downloader:
         hooks: Optional[list[BaseHook]] = None,
         key_param: Optional[str] = None,
         key_format: Optional[str] = None,
+        quiet: bool = False,
     ):
         self.m3u8_source = m3u8_source
         self.output = output
@@ -460,10 +496,17 @@ class M3U8Downloader:
         self.key_param = key_param
         self.key_format = key_format
         self.tmp_dir = tmp_dir
+        self.quiet = quiet
 
         # 默认注册合并钩子 (除非 no_merge)
         if hooks is None:
-            hooks = [SegmentMergeHook(output=output, merge=not no_merge, keep_temp=keep_temp, tmp_dir=tmp_dir)]
+            hooks = [SegmentMergeHook(
+                output=output,
+                merge=not no_merge,
+                keep_temp=keep_temp,
+                tmp_dir=tmp_dir,
+                quiet=quiet,
+            )]
         self.hooks = hooks
 
         # 内部状态
@@ -779,7 +822,7 @@ class M3U8Downloader:
         fail = 0
         total = len(playlist)
 
-        with ProgressBar(total=total, desc="下载进度", unit="seg") as pbar:
+        with ProgressBar(total=total, desc="下载进度", unit="seg", quiet=self.quiet) as pbar:
             with ThreadPoolExecutor(max_workers=self.workers) as executor:
                 futures = {}
                 for i, url in enumerate(urls):
@@ -800,8 +843,7 @@ class M3U8Downloader:
                         pbar.write(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
 
                     if not pbar.update(1):
-                        if (success + fail) % 100 == 0 or (success + fail) == total:
-                            pbar.write(f"  [*] 进度: {ProgressBar.simple_progress(success + fail, total, '进度')} (成功: {success}, 失败: {fail})")
+                        pbar.log_progress(success + fail, total, success, fail)
 
         if fail > 0:
             print(f"[!] {fail} 个片段下载失败, 合并结果可能不完整")
@@ -842,7 +884,7 @@ class M3U8Downloader:
         success = 0
         fail = 0
 
-        with ProgressBar(total=total, desc="下载&上传", unit="seg") as pbar:
+        with ProgressBar(total=total, desc="下载&上传", unit="seg", quiet=self.quiet) as pbar:
             with ThreadPoolExecutor(max_workers=self.workers) as executor:
                 futures = {}
                 for i, url in enumerate(urls):
@@ -860,8 +902,7 @@ class M3U8Downloader:
                         pbar.write(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
 
                     if not pbar.update(1):
-                        if (success + fail) % 100 == 0 or (success + fail) == total:
-                            pbar.write(f"  [*] 进度: {ProgressBar.simple_progress(success + fail, total, '进度')} (成功: {success}, 失败: {fail})")
+                        pbar.log_progress(success + fail, total, success, fail)
 
         if fail > 0:
             print(f"[!] {fail} 个片段失败")
