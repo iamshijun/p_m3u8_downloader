@@ -87,7 +87,17 @@ async function addTask() {
 
 async function doCancel(id) {
   if (!confirm("确定要取消吗?")) return;
-  try { await cancelTask(id); } catch (e) { /* ignore */ }
+  try {
+    // 后端 cancel() 会立即把状态推进到 cancelled (若非终态),
+    // 并在响应里返回最新 status. 直接用响应里的 status 更新卡片,
+    // 不必再发一次 listTasks. pending 任务无 stream 订阅者, 也能
+    // 立即看到终态; running 任务 stream 仍开着, 后续进度会覆盖 UI.
+    const { status } = await cancelTask(id);
+    if (!status) return;
+    taskCard.setStatus(id, status);
+    knownStatuses.set(id, status);
+    syncPoll();
+  } catch (e) { /* ignore */ }
 }
 
 async function doRemove(id) {

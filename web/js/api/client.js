@@ -45,9 +45,10 @@ export async function health() {
   return jsonOrThrow(resp);
 }
 
-// 取消任务 (尽力而为)
+// 取消任务 (尽力而为). 返回 { task_id, cancel_requested, status }
 export async function cancelTask(id) {
-  return fetch(`api/tasks/${id}/cancel`, { method: "POST" });
+  const resp = await fetch(`api/tasks/${id}/cancel`, { method: "POST" });
+  return jsonOrThrow(resp);
 }
 
 // 删除已结束的任务
