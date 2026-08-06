@@ -1,10 +1,18 @@
 // NDJSON 进度流订阅
 import { openTaskStream } from "../api/client.js";
 import { humanSize } from "../utils/dom.js";
-import { taskCard, TERMINAL } from "./taskCard.js";
+import { taskCard } from "./taskCard.js";
 
 // 单个任务的订阅句柄: { aborter, streaming }
 const subs = new Map();
+
+// 任意订阅关闭时的回调 (任务进入终态/流异常/手动取消)
+// 由 tasksPage 注册, 用于在订阅关闭后主动拉取任务列表,
+// 把已经从 pending 转入 running 的任务补订上 stream
+let onStreamClosed = null;
+export function setOnStreamClosed(fn) {
+  onStreamClosed = fn;
+}
 
 function isHandledEvent(ev) {
   if (!ev || typeof ev !== "object") return false;
@@ -100,6 +108,9 @@ export function subscribe(id) {
     } finally {
       handle.streaming = false;
       subs.delete(id);
+      if (onStreamClosed) {
+        try { onStreamClosed(id); } catch { /* 回调异常不影响订阅清理 */ }
+      }
     }
   })();
 

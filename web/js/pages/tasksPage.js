@@ -2,8 +2,32 @@
 import { $ } from "../utils/dom.js";
 import { saveForm } from "../utils/storage.js";
 import { createTask, createBatchTasks, listTasks, cancelTask, removeTask } from "../api/client.js";
-import { taskCard, TERMINAL } from "../components/taskCard.js";
-import { subscribe, unsubscribe } from "../components/eventStream.js";
+import { taskCard } from "../components/taskCard.js";
+import { subscribe, unsubscribe, isSubscribed, setOnStreamClosed } from "../components/eventStream.js";
+
+// 已知任务状态缓存 (id -> status), 用来判断是否需要轮询
+const knownStatuses = new Map();
+let pollTimer = null;
+const POLL_INTERVAL_MS = 2000;
+
+// 根据当前任务状态决定是否启动/停止轮询:
+// - 有 pending 但没有任何 running 订阅: 开启轮询, 等 pending 转为 running 后补订 stream
+// - 有 running 订阅: stream 关闭时会主动触发 refresh, 不需要轮询
+// - 都没有 (全终态): 停掉轮询
+function syncPoll() {
+  let hasRunning = false;
+  let hasPending = false;
+  for (const s of knownStatuses.values()) {
+    if (s === "running") hasRunning = true;
+    else if (s === "pending") hasPending = true;
+  }
+  if (hasPending && !hasRunning) {
+    if (!pollTimer) pollTimer = setInterval(refresh, POLL_INTERVAL_MS);
+  } else if (pollTimer) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+  }
+}
 
 function collectRequest(overrides = {}) {
   const headersRaw = $("headers").value.trim();
@@ -44,12 +68,16 @@ async function addTask() {
   try {
     const { task_id } = await createTask(req);
     saveForm();  // 提交成功后记住本次表单
-    const t = taskCard.ensure({
+    taskCard.ensure({
       id: task_id, input: req.m3u8_input,
       output: req.output, upload: req.upload, status: "pending",
     });
     taskCard.bindControls(task_id, doCancel, doRemove);
-    subscribe(task_id);
+    // 不直接订阅: pending 任务不浪费 stream 连接,
+    // 由下一轮 refresh (立即或轮询) 在任务转 running 后补订
+    knownStatuses.set(task_id, "pending");
+    syncPoll();
+    refresh();  // 立即拉一次, 大多数情况下任务此刻已经 running
   } catch (e) {
     alert("请求异常: " + e.message);
   } finally {
@@ -77,10 +105,20 @@ export async function refresh() {
     for (const snap of list) {
       taskCard.apply(snap);
       taskCard.bindControls(snap.id, doCancel, doRemove);
-      if (!TERMINAL.has(snap.status)) subscribe(snap.id);
+      knownStatuses.set(snap.id, snap.status);
+      // 只订阅 running 任务: pending 任务的 stream 只会空闲等待,
+      // 等任务真正转 running 后再补订即可
+      if (snap.status === "running" && !isSubscribed(snap.id)) {
+        subscribe(snap.id);
+      }
     }
+    syncPoll();
   } catch (e) { /* ignore */ }
 }
+
+// 任意 stream 关闭 (任务进入终态 / 流异常 / 主动取消) 时主动拉一次列表,
+// 把已经从 pending 转入 running 的任务补订上 stream
+setOnStreamClosed(() => { refresh(); });
 
 async function clearDone() {
   for (const id of taskCard.all().slice()) {
