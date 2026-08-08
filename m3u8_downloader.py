@@ -48,6 +48,9 @@ class M3U8DownloadError(Exception):
        self.message = message
        super().__init__(self.message)
 
+# 分片文件命名模板 (统一格式, 修改此处影响所有引用)
+SEGMENT_FILENAME_TPL = "seg_{:06d}"
+
 # ---------------------------------------------------------------------------
 # Progress Manager
 # ---------------------------------------------------------------------------
@@ -217,7 +220,7 @@ class M3U8Playlist:
     def __len__(self) -> int:
         return len(self.segments)
 
-    def to_file_content(self,seg_format = "seg_{:06d}") -> str:
+    def to_file_content(self, seg_format = SEGMENT_FILENAME_TPL) -> str:
         lines = []
         lines.append('#EXTM3U')
         lines.append(f'#EXT-X-VERSION:{self.version}')
@@ -346,6 +349,11 @@ class SegmentMergeHook(BaseHook):
         self.keep_temp = keep_temp
         self.tmp_dir = tmp_dir
         self.quiet = quiet
+        self._m3u8_file: Optional[str] = None
+
+    def set_m3u8_source_path(self, path: str) -> None:
+        """设置 m3u8 源文件路径, 用于 no-merge 模式下拷贝到分片目录."""
+        self._m3u8_file = path
 
     def on_all_downloaded(self, playlist: M3U8Playlist, tmp_dir: str) -> None:
         if self.merge:
@@ -360,7 +368,7 @@ class SegmentMergeHook(BaseHook):
         with ProgressBar(total=total, desc="合并进度", unit="seg", quiet=self.quiet) as pbar:
             with open(self.output, "wb") as outfile:
                 for i in range(total):
-                    path = os.path.join(tmp_dir, f"seg_{i:06d}")
+                    path = os.path.join(tmp_dir, SEGMENT_FILENAME_TPL.format(i))
                     if os.path.exists(path):
                         with open(path, "rb") as infile:
                             shutil.copyfileobj(infile, outfile)
@@ -368,8 +376,8 @@ class SegmentMergeHook(BaseHook):
 
     def _keep_segments(self, tmp_dir: str) -> None:
         """保留分片: 将临时目录重命名并拷贝 m3u8文件."""
-        #  _m3u8_file 属性获取为 注入到 hook的属性
-        m3u8_src: Optional[str] = getattr(self, "_m3u8_file", None)
+        #  m3u8 源文件路径通过 set_m3u8_source_path 注入
+        m3u8_src: Optional[str] = self._m3u8_file
         m3u8_dest = os.path.join(tmp_dir, "playlist.m3u8")
         if m3u8_src and os.path.isfile(m3u8_src):
             os.makedirs(os.path.dirname(m3u8_dest), exist_ok=True)
@@ -428,7 +436,7 @@ class YunpanUploadHook(BaseHook):
 
     def on_segment_data(self, index: int, segment: M3U8Segment, data: bytes, filename: str) -> None:
         """不落地模式: 直接上传 bytes."""
-        remote_path = f"{self.remote_prefix}/seg_{index:06d}"
+        remote_path = f"{self.remote_prefix}/{SEGMENT_FILENAME_TPL.format(index)}"
         self._do_upload_bytes(data, filename, remote_path)
 
     def _do_upload(self, local_path: str, remote_path: str) -> None:
@@ -603,7 +611,7 @@ class M3U8Downloader:
             return
         for hook in self.hooks:
             if isinstance(hook, SegmentMergeHook):
-                hook._m3u8_file = m3u8_file
+                hook.set_m3u8_source_path(m3u8_file)
 
     def _finalize(self) -> str:
         """收尾: 调用 on_finish, 清理临时文件, 打印结果."""
@@ -855,7 +863,7 @@ class M3U8Downloader:
                 futures = {}
                 for i, url in enumerate(urls):
                     #统一为6位的seg片段标识
-                    dest = os.path.join(self.tmp_dir, f"seg_{i:06d}")
+                    dest = os.path.join(self.tmp_dir, SEGMENT_FILENAME_TPL.format(i))
                     seg_key = playlist.segments[i].key
                     futures[executor.submit(
                         self._download_segment_task, url, dest, i, playlist.segments[i], seg_key
@@ -948,7 +956,7 @@ class M3U8Downloader:
                 raw = self.http.get(url)
                 if key_info is not None:
                     raw = self._decrypt(raw, key_info)
-                filename = os.path.basename(urlparse(url).path) or f"seg_{index:06d}"
+                filename = os.path.basename(urlparse(url).path) or SEGMENT_FILENAME_TPL.format(index)
                 for hook in self.hooks:
                     hook.on_segment_data(index, segment, raw, filename)
                 return (index, "ok")
