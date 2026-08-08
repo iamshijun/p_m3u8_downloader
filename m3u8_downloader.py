@@ -400,8 +400,15 @@ class SegmentMergeHook(BaseHook):
             pass  # 由外部处理
 
 
-class YunpanUploadHook(BaseHook):
-    """上传钩子: 每下载完一个分片就上传到百度云盘."""
+class UploadHook(BaseHook, ABC):
+    """上传钩子抽象基类: 定义上传后端的统一接口.
+
+    子类需实现 on_segment / on_segment_data 将分片数据上传到目标存储.
+    """
+
+
+class YunpanUploadHook(UploadHook):
+    """百度云盘上传钩子: 每下载完一个分片就上传到百度云盘."""
 
     def __init__(
         self,
@@ -422,7 +429,7 @@ class YunpanUploadHook(BaseHook):
             self.upload_bytes = upload_bytes
         except ImportError:
             print(f"[!] 无法导入 yunpan_hls")
-            raise 
+            raise
 
     def on_playlist_parsed(self, playlist: M3U8Playlist):
         content = playlist.to_file_content()
@@ -465,6 +472,17 @@ class YunpanUploadHook(BaseHook):
             #print(f"[*] 上传成功: {remote_path} (fs_id={result.get('fs_id', '?')})")
         except Exception as e:
             print(f"[!] 上传失败: {remote_path} — {e}")
+
+
+def create_upload_hook(hook_type: str, **kwargs) -> UploadHook:
+    """工厂函数: 根据类型创建对应的 upload hook.
+
+    当前支持的 hook_type:
+      - "yunpan" → YunpanUploadHook
+    """
+    if hook_type == "yunpan":
+        return YunpanUploadHook(**kwargs)
+    raise ValueError(f"Unknown upload hook type: {hook_type}")
 
 
 # ---------------------------------------------------------------------------
@@ -1059,7 +1077,8 @@ def main() -> None:
         if not token:
             print("[!] 启用 --upload 但未提供 ACCESS_TOKEN, 请用 --upload-token 指定或写入 .env")
             sys.exit(1)
-        hooks.append(YunpanUploadHook(
+        hooks.append(create_upload_hook(
+            "yunpan",
             token=token,
             remote_prefix=args.upload,
             ondup=args.upload_ondup,

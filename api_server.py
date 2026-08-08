@@ -56,7 +56,9 @@ from m3u8_downloader import (
     M3U8Playlist,
     M3U8Segment,
     SegmentMergeHook,
+    UploadHook,
     YunpanUploadHook,
+    create_upload_hook,
 )
 
 
@@ -81,6 +83,22 @@ CLEANUP_INTERVAL = 60          # 清理线程扫描间隔（秒）
 # ---------------------------------------------------------------------------
 
 
+class UploadConfig(BaseModel):
+    """通用上传配置: 后端无关的上传参数.
+
+    支持通过 type 字段选择不同的上传后端 (yunpan / s3 / gcs / local 等).
+    通用字段: type, path, token
+    后端特有字段以 flat 方式内联 (兼容 yunpan 的 ondup / max_retries / delete_after_upload).
+    """
+
+    type: str = Field("yunpan", description="上传后端类型: yunpan / s3 / gcs / local")
+    path: str = Field(..., description="远程/目标路径")
+    token: Optional[str] = Field(None, description="认证 token (部分后端需要)")
+    ondup: str = Field("overwrite", description="冲突策略 (yunpan): fail / overwrite / newcopy")
+    max_retries: int = Field(5, description="上传重试次数")
+    delete_after_upload: bool = Field(True, description="上传成功后是否删除本地分片")
+
+
 class DownloadRequest(BaseModel):
     """下载请求参数, 字段与 m3u8_downloader 命令行参数一一对应."""
 
@@ -98,12 +116,8 @@ class DownloadRequest(BaseModel):
     no_merge: bool = Field(False, description="不合并, 保留分片目录 + m3u8")
     no_disk: bool = Field(False, description="不落磁盘, 直接推给 upload hook")
 
-    # 上传相关
-    upload: Optional[str] = Field(None, description="上传到百度云盘的远程目录")
-    upload_token: Optional[str] = Field(None, description="百度 ACCESS_TOKEN")
-    upload_ondup: str = Field("overwrite", description="冲突策略: fail/overwrite/newcopy")
-    upload_retries: int = Field(5, description="上传重试次数")
-    upload_delete: bool = Field(True, description="上传成功后是否删除本地分片")
+    # 上传配置 (可选, 传入时触发上传)
+    upload: Optional[UploadConfig] = Field(None, description="上传配置")
 
 
 class BatchDownloadRequest(BaseModel):
@@ -299,12 +313,13 @@ class Task:
                 self._subscribers.remove(q)
 
     def snapshot(self) -> dict:
+        upload_path = self.req.upload.path if self.req.upload else None
         return {
             "id": self.id,
             "status": self.status.value,
             "input": self.req.m3u8_input,
             "output": self.result or self.req.output,
-            "upload": self.req.upload,
+            "upload": upload_path,
             "total": self.total,
             "done": self.done,
             "encrypted": self.encrypted,
@@ -326,6 +341,16 @@ def _safe_name(name: str) -> str:
     """取 basename 并过滤危险字符, 防止路径穿越."""
     base = os.path.basename(name or "").strip() or "output.ts"
     return re.sub(r"[^\w.\-]", "_", base)
+
+
+def _run_preflight(hook_type: str, token: str) -> None:
+    """上传预检: 根据后端类型执行对应的认证/连通性检查."""
+    if hook_type == "yunpan":
+        from pan_upload import preflight_check
+        preflight_check(token=token)
+    # 其他后端可在此扩展
+    # elif hook_type == "s3":
+    #     _s3_preflight(...)
 
 
 class TaskManager:
@@ -467,28 +492,28 @@ class TaskManager:
             ]
 
             if req.upload:
-                token = req.upload_token or os.getenv("ACCESS_TOKEN")
+                upload_cfg = req.upload
+                token = upload_cfg.token or os.getenv("ACCESS_TOKEN")
                 if not token:
-                    task.error = "upload 需要 upload_token 或 .env ACCESS_TOKEN"
+                    task.error = "upload 需要 upload.token 或 .env ACCESS_TOKEN"
                     task.set_status(TaskStatus.ERROR, message=task.error)
                     return
-                # 下载前预检: 通过 /api/quota 验证 access_token (errno=6 = 身份认证失败),
-                # 失败立即终止, 避免浪费带宽下载一堆分片后再发现 token 失效.
-                task.emit({"type": "preflight", "upload": req.upload})
+                # 下载前预检 (按后端类型分别校验)
+                task.emit({"type": "preflight", "upload": upload_cfg.path})
                 try:
-                    from pan_upload import preflight_check
-                    info = preflight_check(token=token)
-                    task.emit({"type": "preflight_ok", "upload": req.upload, **info})
+                    _run_preflight(upload_cfg.type, token)
                 except Exception as e:
-                    task.error = f"云盘预检失败: {e}"
+                    task.error = f"上传预检失败: {e}"
                     task.set_status(TaskStatus.ERROR, message=task.error, stage="preflight")
                     return
-                hooks.append(YunpanUploadHook(
+                task.emit({"type": "preflight_ok", "upload": upload_cfg.path})
+                hooks.append(create_upload_hook(
+                    upload_cfg.type,
                     token=token,
-                    remote_prefix=req.upload,
-                    ondup=req.upload_ondup,
-                    max_retries=req.upload_retries,
-                    delete_after_upload=req.upload_delete,
+                    remote_prefix=upload_cfg.path,
+                    ondup=upload_cfg.ondup,
+                    max_retries=upload_cfg.max_retries,
+                    delete_after_upload=upload_cfg.delete_after_upload,
                 ))
 
             config = DownloadConfig(
@@ -571,25 +596,33 @@ def download_batch(req: BatchDownloadRequest) -> dict:
         item = dict(raw)
         line_no = item.pop("line", i)
         url = str(item.get("m3u8_input") or "").strip()
-        #upload path
-        name = str(item.get("upload") or "").strip()
+        # upload 可能是字符串 (兼容) 或 UploadConfig dict
+        upload_raw = item.get("upload")
+        upload_path = ""
+        if isinstance(upload_raw, str):
+            upload_path = upload_raw.strip()
+            if upload_path:
+                item["upload"] = {"type": "yunpan", "path": upload_path}
+            else:
+                item["upload"] = None
+        elif isinstance(upload_raw, dict):
+            upload_path = str(upload_raw.get("path", "") or "").strip()
 
         if not url:
             errors.append({"line": line_no, "reason": "缺少 URL"})
             continue
-        if not name:
+        if not upload_path:
             errors.append({"line": line_no, "reason": "缺少文件名", "input": url})
             continue
         if url in seen_urls:
             skipped.append({"line": line_no, "reason": "URL 重复", "input": url})
             continue
-        name_key = name #_safe_name(name) FIXME 
+        name_key = upload_path
         if name_key in seen_names:
-            skipped.append({"line": line_no, "reason": "文件名重复", "upload": name})
+            skipped.append({"line": line_no, "reason": "文件名重复", "upload": upload_path})
             continue
 
         item["m3u8_input"] = url
-        item["upload"] = name
         try:
             task_req = DownloadRequest(**item)
         except Exception as e:
@@ -599,7 +632,7 @@ def download_batch(req: BatchDownloadRequest) -> dict:
         seen_urls.add(url)
         seen_names.add(name_key)
         task = manager.create(task_req)
-        created.append({"task_id": task.id, "m3u8_input": url, "upload": name})
+        created.append({"task_id": task.id, "m3u8_input": url, "upload": upload_path})
 
     return {"created": created, "skipped": skipped, "errors": errors}
 

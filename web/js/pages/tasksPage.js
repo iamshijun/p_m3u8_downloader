@@ -49,13 +49,16 @@ function collectRequest(overrides = {}) {
     no_merge: $("no_merge").checked,
     no_disk: $("no_disk").checked,
   };
-  const upload = $("upload").value.trim();
-  if (upload) {
-    req.upload = upload;
-    req.upload_token = $("upload_token").value.trim() || null;
-    req.upload_ondup = $("upload_ondup").value;
-    req.upload_retries = parseInt($("upload_retries").value) || 5;
-    req.upload_delete = $("upload_delete").checked;
+  const uploadPath = $("upload").value.trim();
+  if (uploadPath) {
+    req.upload = {
+      type: "yunpan",
+      path: uploadPath,
+      token: $("upload_token").value.trim() || null,
+      ondup: $("upload_ondup").value,
+      max_retries: parseInt($("upload_retries").value) || 5,
+      delete_after_upload: $("upload_delete").checked,
+    };
   }
   return Object.assign(req, overrides);
 }
@@ -70,7 +73,9 @@ async function addTask() {
     saveForm();  // 提交成功后记住本次表单
     taskCard.ensure({
       id: task_id, input: req.m3u8_input,
-      output: req.output, upload: req.upload, status: "pending",
+      output: req.output,
+      upload: req.upload ? req.upload.path : null,
+      status: "pending",
     });
     taskCard.bindControls(task_id, doCancel, doRemove);
     // 不直接订阅: pending 任务不浪费 stream 连接,
