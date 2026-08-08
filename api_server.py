@@ -50,6 +50,7 @@ from pydantic import BaseModel, Field
 
 from m3u8_downloader import (
     BaseHook,
+    DownloadConfig,
     HTTPClient,
     M3U8Downloader,
     M3U8Playlist,
@@ -490,7 +491,7 @@ class TaskManager:
                     delete_after_upload=req.upload_delete,
                 ))
 
-            downloader = M3U8Downloader(
+            config = DownloadConfig(
                 m3u8_source=req.m3u8_input,
                 output=output_path,
                 base_url=req.base_url,
@@ -500,11 +501,14 @@ class TaskManager:
                 keep_temp=req.keep_temp,
                 tmp_dir=tmp_dir,
                 no_disk=req.no_disk,
-                http_client=http,
-                hooks=hooks,
                 key_param=req.key_param,
                 key_format=req.key_format,
                 quiet=True,
+            )
+            downloader = M3U8Downloader(
+                config=config,
+                http_client=http,
+                hooks=hooks,
             )
 
             result = downloader.run()

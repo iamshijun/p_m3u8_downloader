@@ -92,7 +92,7 @@ class ProgressBar:
         """退出 with 语法，自动关闭进度条."""
         self.close()
 
-    def update(self, n: int = 1) -> None:
+    def update(self, n: int = 1) -> bool:
         """更新进度.
 
         Args:
@@ -255,7 +255,6 @@ class HTTPClient:
         if proxy:
             proxy_handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
             self._opener = urllib.request.build_opener(proxy_handler)
-            urllib.request.install_opener(self._opener)
             print(f"[*] 使用代理: {proxy}")
 
         if self.headers:
@@ -495,6 +494,23 @@ DEFAULT_USER_AGENT = (
 )
 
 
+@dataclass
+class DownloadConfig:
+    """下载配置: 将 M3U8Downloader 的配置参数聚合成一个 dataclass."""
+    m3u8_source: str
+    output: str = "output.ts"
+    base_url: Optional[str] = None
+    workers: int = 10
+    retries: int = 3
+    no_merge: bool = False
+    tmp_dir: Optional[str] = None
+    keep_temp: bool = False
+    no_disk: bool = False
+    key_param: Optional[str] = None
+    key_format: Optional[str] = None
+    quiet: bool = False
+
+
 class M3U8Downloader:
     """M3U8 视频下载器: 获取 m3u8 → 解析 → 下载片段 → 解密 → [hooks].
 
@@ -507,43 +523,21 @@ class M3U8Downloader:
 
     def __init__(
         self,
-        m3u8_source: str,
-        output: str = "output.ts",
-        base_url: Optional[str] = None,
-        workers: int = 10,
-        retries: int = 3,
-        no_merge: bool = False,
-        tmp_dir : Optional[str] = None,
-        keep_temp: bool = False,
-        no_disk: bool = False,
+        config: DownloadConfig,
         http_client: Optional[HTTPClient] = None,
         hooks: Optional[list[BaseHook]] = None,
-        key_param: Optional[str] = None,
-        key_format: Optional[str] = None,
-        quiet: bool = False,
     ):
-        self.m3u8_source = m3u8_source
-        self.output = output
-        self.base_url = base_url
-        self.workers = workers
-        self.retries = retries
-        self.no_merge = no_merge
-        self.keep_temp = keep_temp
-        self.no_disk = no_disk
+        self.config = config
         self.http = http_client or HTTPClient()
-        self.key_param = key_param
-        self.key_format = key_format
-        self.tmp_dir = tmp_dir
-        self.quiet = quiet
 
         # 默认注册合并钩子 (除非 no_merge)
         if hooks is None:
             hooks = [SegmentMergeHook(
-                output=output,
-                merge=not no_merge,
-                keep_temp=keep_temp,
-                tmp_dir=tmp_dir,
-                quiet=quiet,
+                output=config.output,
+                merge=not config.no_merge,
+                keep_temp=config.keep_temp,
+                tmp_dir=config.tmp_dir,
+                quiet=config.quiet,
             )]
         self.hooks = hooks
 
@@ -576,13 +570,13 @@ class M3U8Downloader:
         for hook in self.hooks:
             hook.on_playlist_parsed(playlist)
 
-        if not self.tmp_dir: #如果没有指定创建一个
-            self.tmp_dir = tempfile.mkdtemp(prefix="m3u8_dl_")
-        print(f"[*] 临时目录: {self.tmp_dir}")
+        if not self.config.tmp_dir: #如果没有指定创建一个
+            self.config.tmp_dir = tempfile.mkdtemp(prefix="m3u8_dl_")
+        print(f"[*] 临时目录: {self.config.tmp_dir}")
         # -- no_disk 模式: 下载后直接 on_segment_data, 不写磁盘 -------------------
-        if self.no_disk:
+        if self.config.no_disk:
             self._download_segments_no_disk(playlist)
-            result = self.output
+            result = self.config.output
             for hook in self.hooks:
                 hook.on_finish(result)
             self._cleanup()
@@ -597,7 +591,7 @@ class M3U8Downloader:
 
         # 调用 on_all_downloaded
         for hook in self.hooks:
-            hook.on_all_downloaded(playlist, self.tmp_dir)
+            hook.on_all_downloaded(playlist, self.config.tmp_dir)
 
         result_path = self._finalize()
         return result_path
@@ -605,7 +599,7 @@ class M3U8Downloader:
     def _inject_m3u8_context(self) -> None:
         """将 m3u8 源文件路径注入到 SegmentMergeHook."""
         m3u8_file = self._tmp_m3u8_path or (
-            self.m3u8_source if os.path.isfile(self.m3u8_source) else None
+            self.config.m3u8_source if os.path.isfile(self.config.m3u8_source) else None
         )
         if m3u8_file is None:
             return
@@ -615,20 +609,20 @@ class M3U8Downloader:
 
     def _finalize(self) -> str:
         """收尾: 调用 on_finish, 清理临时文件, 打印结果."""
-        if self.no_merge:
+        if self.config.no_merge:
             # 如果指定了keep-temp ，直接使用该目录
-            if self.keep_temp:
-                result = self.tmp_dir
+            if self.config.keep_temp:
+                result = self.config.tmp_dir
                 print(f"[*] 完成! 切片目录: {result}")
             else:
-                name, _ = os.path.splitext(self.output)
+                name, _ = os.path.splitext(self.config.output)
                 result = name + "_segments"
                 print(f"[*] 完成! 切片目录: {result}")
         else:
-            result = self.output
-            if os.path.exists(self.output):
-                total_size_mb = os.path.getsize(self.output) / (1024 * 1024)
-                print(f"[*] 完成! 输出文件: {self.output} ({total_size_mb:.1f} MB)")
+            result = self.config.output
+            if os.path.exists(self.config.output):
+                total_size_mb = os.path.getsize(self.config.output) / (1024 * 1024)
+                print(f"[*] 完成! 输出文件: {self.config.output} ({total_size_mb:.1f} MB)")
 
         for hook in self.hooks:
             hook.on_finish(result)
@@ -640,9 +634,9 @@ class M3U8Downloader:
 
     def _fetch_playlist(self) -> M3U8Playlist:
         """获取 m3u8 内容 (支持 URL 或本地文件) 并解析."""
-        if urlparse(self.m3u8_source).scheme in ("http", "https"):
-            print(f"[*] 下载 m3u8 文件: {self.m3u8_source}")
-            content = self.http.get_text(self.m3u8_source)
+        if urlparse(self.config.m3u8_source).scheme in ("http", "https"):
+            print(f"[*] 下载 m3u8 文件: {self.config.m3u8_source}")
+            content = self.http.get_text(self.config.m3u8_source)
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".m3u8", delete=False, encoding="utf-8"
             ) as tmp:
@@ -650,8 +644,8 @@ class M3U8Downloader:
                 self._tmp_m3u8_path = tmp.name
             return self._parse_playlist(content)
         else:
-            print(f"[*] 解析 m3u8 文件: {self.m3u8_source}")
-            with open(self.m3u8_source, "r", encoding="utf-8") as f:
+            print(f"[*] 解析 m3u8 文件: {self.config.m3u8_source}")
+            with open(self.config.m3u8_source, "r", encoding="utf-8") as f:
                 return self._parse_playlist(f.read())
 
     def _resolve_master_playlist(self, master: M3U8Playlist) -> M3U8Playlist:
@@ -685,8 +679,8 @@ class M3U8Downloader:
 
         # 更新源: 后续 _resolve_base_url 会基于变体 URL 重新推导 base_url
         # 重置 base_url, 确保变体 m3u8 内的相对分片 URL 能正确解析到变体所在目录
-        self.m3u8_source = variant_url
-        self.base_url = None
+        self.config.m3u8_source = variant_url
+        self.config.base_url = None
 
         return self._parse_playlist(content)
 
@@ -788,30 +782,30 @@ class M3U8Downloader:
 
     def _resolve_base_url(self) -> None:
         """确定 base_url, 用于拼接相对路径."""
-        if self.base_url is not None:
-            self.base_url = self.base_url.rstrip("/") + "/"
-            print(f"[*] 根 URL (--base_url): {self.base_url}")
+        if self.config.base_url is not None:
+            self.config.base_url = self.config.base_url.rstrip("/") + "/"
+            print(f"[*] 根 URL (--base_url): {self.config.base_url}")
         elif self._tmp_m3u8_path is not None:
-            self.base_url = os.path.dirname(self.m3u8_source) + "/"
-            print(f"[*] 根 URL (自动): {self.base_url}")
-        elif self.m3u8_source and urlparse(self.m3u8_source).scheme in ("http", "https"):
-            self.base_url = os.path.dirname(self.m3u8_source) + "/"
-            print(f"[*] 根 URL (自动): {self.base_url}")
+            self.config.base_url = os.path.dirname(self.config.m3u8_source) + "/"
+            print(f"[*] 根 URL (自动): {self.config.base_url}")
+        elif self.config.m3u8_source and urlparse(self.config.m3u8_source).scheme in ("http", "https"):
+            self.config.base_url = os.path.dirname(self.config.m3u8_source) + "/"
+            print(f"[*] 根 URL (自动): {self.config.base_url}")
 
     def _resolve_url(self, uri: str) -> str:
         """将相对 URI 拼接为完整 URL."""
         if urlparse(uri).netloc:
             return uri
-        if self.base_url is None:
+        if self.config.base_url is None:
             raise M3U8DownloadError(f"[!] 无法拼接相对路径 '{uri}', 未提供 base_url")
-        return urljoin(self.base_url, uri)
+        return urljoin(self.config.base_url, uri)
 
     def _resolve_url_with_token(self, uri: str) -> str:
         """将相对 URI 拼接为完整 URL 并按需 附加其他参数."""
         from urllib.parse import parse_qs, parse_qsl,urlencode, urlparse, urlunparse
 
         url = self._resolve_url(uri)
-        if not self.key_param:
+        if not self.config.key_param:
             return url
 
         # 解析 URL 和查询参数
@@ -819,13 +813,14 @@ class M3U8Downloader:
         query_params = parse_qs(parsed.query) if parsed.query else {}
 
         # 解析 key_param 为字典（parse_qsl 返回键值对元组列表）
-        new_params = dict(parse_qsl(self.key_param))
+        new_params = dict(parse_qsl(self.config.key_param))
         # 合并（新参数覆盖旧参数）
         query_params.update(new_params)
 
         # 重建 URL
         new_query = urlencode(query_params, doseq=True)
-        return urlunparse(parsed._replace(query=new_query))
+        return urlunparse((parsed.scheme, parsed.netloc, parsed.path,
+                             parsed.params, new_query, parsed.fragment))
 
     # -- encryption ----------------------------------------------------------
 
@@ -851,19 +846,19 @@ class M3U8Downloader:
     def _download_segments(self, playlist: M3U8Playlist) -> list[str]:
         """并发下载所有片段 (含解密 + on_segment hook)."""
         urls = [self._resolve_url(seg.uri) for seg in playlist.segments]
-        print(f"[*] 开始下载 (并发数: {self.workers})...")
+        print(f"[*] 开始下载 (并发数: {self.config.workers})...")
 
         paths: list[Optional[str]] = [None] * len(playlist)
         success = 0
         fail = 0
         total = len(playlist)
 
-        with ProgressBar(total=total, desc="下载进度", unit="seg", quiet=self.quiet) as pbar:
-            with ThreadPoolExecutor(max_workers=self.workers) as executor:
+        with ProgressBar(total=total, desc="下载进度", unit="seg", quiet=self.config.quiet) as pbar:
+            with ThreadPoolExecutor(max_workers=self.config.workers) as executor:
                 futures = {}
                 for i, url in enumerate(urls):
                     #统一为6位的seg片段标识
-                    dest = os.path.join(self.tmp_dir, SEGMENT_FILENAME_TPL.format(i))
+                    dest = os.path.join(self.config.tmp_dir, SEGMENT_FILENAME_TPL.format(i))
                     seg_key = playlist.segments[i].key
                     futures[executor.submit(
                         self._download_segment_task, url, dest, i, playlist.segments[i], seg_key
@@ -895,7 +890,7 @@ class M3U8Downloader:
         key_info: Optional[KeyInfo] = None,
     ) -> tuple[int, str, str]:
         """下载单个片段, 失败自动重试, 支持解密 + on_segment hook."""
-        for attempt in range(self.retries):
+        for attempt in range(self.config.retries):
             try:
                 raw = self.http.get(url)
                 if key_info is not None:
@@ -907,7 +902,7 @@ class M3U8Downloader:
                     hook.on_segment(index, segment, dest)
                 return (index, dest, "ok")
             except Exception as e:
-                if attempt == self.retries - 1:
+                if attempt == self.config.retries - 1:
                     return (index, "", f"失败: {e}")
                 time.sleep(1 * (attempt + 1))
         return (index, "", "unknown error")
@@ -915,13 +910,13 @@ class M3U8Downloader:
     def _download_segments_no_disk(self, playlist: M3U8Playlist) -> None:
         """不落地下载: 下载解密后直接 on_segment_data, 不写磁盘."""
         urls = [self._resolve_url(seg.uri) for seg in playlist.segments]
-        print(f"[*] 开始不落地下载 (并发数: {self.workers})...")
+        print(f"[*] 开始不落地下载 (并发数: {self.config.workers})...")
         total = len(playlist)
         success = 0
         fail = 0
 
-        with ProgressBar(total=total, desc="下载&上传", unit="seg", quiet=self.quiet) as pbar:
-            with ThreadPoolExecutor(max_workers=self.workers) as executor:
+        with ProgressBar(total=total, desc="下载&上传", unit="seg", quiet=self.config.quiet) as pbar:
+            with ThreadPoolExecutor(max_workers=self.config.workers) as executor:
                 futures = {}
                 for i, url in enumerate(urls):
                     seg = playlist.segments[i]
@@ -951,7 +946,7 @@ class M3U8Downloader:
         key_info: Optional[KeyInfo] = None,
     ) -> tuple[int, str]:
         """下载 + 解密 + on_segment_data (不写磁盘)."""
-        for attempt in range(self.retries):
+        for attempt in range(self.config.retries):
             try:
                 raw = self.http.get(url)
                 if key_info is not None:
@@ -961,7 +956,7 @@ class M3U8Downloader:
                     hook.on_segment_data(index, segment, raw, filename)
                 return (index, "ok")
             except Exception as e:
-                if attempt == self.retries - 1:
+                if attempt == self.config.retries - 1:
                     return (index, f"失败: {e}")
                 time.sleep(1 * (attempt + 1))
         return (index, "unknown error")
@@ -982,13 +977,13 @@ class M3U8Downloader:
 
     def _cleanup(self) -> None:
         """清理临时文件."""
-        if self.keep_temp:
-            if self.tmp_dir:
-                print(f"[*] 临时文件保留在: {self.tmp_dir}")
+        if self.config.keep_temp:
+            if self.config.tmp_dir:
+                print(f"[*] 临时文件保留在: {self.config.tmp_dir}")
         else:
             print("[*] 清理临时文件...")
-            if self.tmp_dir:
-                shutil.rmtree(self.tmp_dir, ignore_errors=True)
+            if self.config.tmp_dir:
+                shutil.rmtree(self.config.tmp_dir, ignore_errors=True)
                 
         if self._tmp_m3u8_path and os.path.exists(self._tmp_m3u8_path):
             os.unlink(self._tmp_m3u8_path)
@@ -1075,7 +1070,7 @@ def main() -> None:
     headers = HTTPClient.parse_headers(args.header)
     http = HTTPClient(headers=headers, proxy=args.proxy, timeout=args.timeout)
 
-    downloader = M3U8Downloader(
+    config = DownloadConfig(
         m3u8_source=args.m3u8_input,
         output=args.output,
         base_url=args.base_url,
@@ -1085,10 +1080,13 @@ def main() -> None:
         keep_temp=args.keep_temp,
         tmp_dir=args.tmp_dir,
         no_disk=args.no_disk,
+        key_param=args.key_param,
+        key_format=args.key_format,
+    )
+    downloader = M3U8Downloader(
+        config=config,
         http_client=http,
         hooks=hooks,
-        key_param=args.key_param,
-        key_format=args.key_format
     )
     downloader.run()
 
