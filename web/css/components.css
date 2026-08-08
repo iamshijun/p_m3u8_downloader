@@ -65,6 +65,21 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .times b { color: var(--text); }
 .times .elapsed.live { color: #38bdf8; }
 
+/* 任务统计总览 (内嵌于 h2, 作三点式居中) */
+.task-summary {
+  display: inline-flex;
+  align-items: center;
+  gap: 14px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.task-summary b {
+  font-weight: 700;
+  color: var(--text);
+}
+.task-summary .s-running { color: #38bdf8; }
+.task-summary .s-pending { color: #b68030; }
+
 /* 状态徽章 */
 .badge {
   display: inline-block;

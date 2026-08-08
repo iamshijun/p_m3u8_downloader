@@ -95,7 +95,7 @@
       </div>
 
       <div class="actions">
-        <button id="btnAdd">添加下载任务</button>
+        <button id="btnAdd">添加任务</button>
         <button id="btnImport" class="secondary">批量导入</button>
         <button id="btnRefresh" class="secondary">刷新列表</button>
       </div>
@@ -104,6 +104,11 @@
     <div class="panel">
       <h2>
         <span>任务列表</span>
+        <span class="task-summary" id="taskSummary">
+          运行中 <b id="sumRunning" class="s-running">0</b>
+          等待中 <b id="sumPending" class="s-pending">0</b>
+          总计 <b id="sumTotal">0</b>
+        </span>
         <button id="btnClearDone" class="secondary small">清除已结束</button>
       </h2>
       <div id="taskList"></div>

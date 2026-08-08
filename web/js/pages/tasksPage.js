@@ -3,12 +3,26 @@ import { $ } from "../utils/dom.js";
 import { saveForm } from "../utils/storage.js";
 import { createTask, createBatchTasks, listTasks, cancelTask, removeTask } from "../api/client.js";
 import { taskCard } from "../components/taskCard.js";
-import { subscribe, unsubscribe, isSubscribed, setOnStreamClosed } from "../components/eventStream.js";
+import { subscribe, unsubscribe, isSubscribed, setOnStreamClosed, setOnStatusChange } from "../components/eventStream.js";
 
 // 已知任务状态缓存 (id -> status), 用来判断是否需要轮询
 const knownStatuses = new Map();
 let pollTimer = null;
 const POLL_INTERVAL_MS = 2000;
+
+// 更新顶部任务统计总览
+function updateSummary() {
+  let running = 0, pending = 0, total = 0;
+  for (const id of taskCard.all()) {
+    total++;
+    const s = knownStatuses.get(id) || (taskCard.get(id)?.statusEl?.textContent);
+    if (s === "running") running++;
+    else if (s === "pending") pending++;
+  }
+  $("sumRunning").textContent = running;
+  $("sumPending").textContent = pending;
+  $("sumTotal").textContent = total;
+}
 
 // 根据当前任务状态决定是否启动/停止轮询:
 // - 有 pending 但没有任何 running 订阅: 开启轮询, 等 pending 转为 running 后补订 stream
@@ -81,6 +95,7 @@ async function addTask() {
     // 不直接订阅: pending 任务不浪费 stream 连接,
     // 由下一轮 refresh (立即或轮询) 在任务转 running 后补订
     knownStatuses.set(task_id, "pending");
+    updateSummary();
     syncPoll();
     refresh();  // 立即拉一次, 大多数情况下任务此刻已经 running
   } catch (e) {
@@ -101,6 +116,7 @@ async function doCancel(id) {
     if (!status) return;
     taskCard.setStatus(id, status);
     knownStatuses.set(id, status);
+    updateSummary();
     syncPoll();
   } catch (e) { /* ignore */ }
 }
@@ -112,6 +128,7 @@ async function doRemove(id) {
     if (!resp.ok) { alert("删除失败(任务未结束?)"); return; }
   } catch (e) { return; }
   taskCard.remove(id);
+  updateSummary();
 }
 
 export async function refresh() {
@@ -128,6 +145,7 @@ export async function refresh() {
       }
     }
     syncPoll();
+    updateSummary();
   } catch (e) { /* ignore */ }
 }
 
@@ -139,6 +157,7 @@ async function clearDone() {
   for (const id of taskCard.all().slice()) {
     if (taskCard.isTerminal(id)) await doRemove(id);
   }
+  updateSummary();
 }
 
 // ---- 批量导入 ----
@@ -245,6 +264,7 @@ async function importTasks() {
 
 // 启动时绑定按钮事件
 export function bindPage() {
+  setOnStatusChange(updateSummary);
   $("btnAdd").addEventListener("click", addTask);
   $("btnRefresh").addEventListener("click", refresh);
   $("btnClearDone").addEventListener("click", clearDone);

@@ -14,6 +14,12 @@ export function setOnStreamClosed(fn) {
   onStreamClosed = fn;
 }
 
+// 状态变更回调, 用于通知外部更新任务统计总览
+let onStatusChange = null;
+export function setOnStatusChange(fn) {
+  onStatusChange = fn;
+}
+
 function isHandledEvent(ev) {
   if (!ev || typeof ev !== "object") return false;
   return ["connected", "start", "playlist", "segment",
@@ -60,6 +66,7 @@ function dispatch(t, ev) {
       } else if (ev.status === "running") {
         taskCard.log(t.id, "开始运行");
       }
+      if (onStatusChange) onStatusChange(ev.status);
       break;
     case "heartbeat":
       break;
