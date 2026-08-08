@@ -174,12 +174,13 @@ export const taskCard = {
   setStatus(id, status) { return setStatusBadge(tasks[id], status); },
   setProgress(id, done, total) { return setProgress(tasks[id], done, total); },
 
-  // 绑定取消/删除按钮回调
+  // 绑定取消/删除按钮回调 (仅首次, 避免重复绑定)
   bindControls(id, onCancel, onRemove) {
     const t = tasks[id];
-    if (!t) return;
+    if (!t || t._controlsBound) return;
     t.btnCancel.addEventListener("click", () => onCancel(id));
     t.btnRemove.addEventListener("click", () => onRemove(id));
+    t._controlsBound = true;
   },
 
   remove(id) {
