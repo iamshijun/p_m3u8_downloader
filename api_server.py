@@ -51,6 +51,7 @@ from pydantic import BaseModel, Field
 from m3u8_downloader import (
     BaseHook,
     DownloadConfig,
+    HookContext,
     HTTPClient,
     M3U8Downloader,
     M3U8Playlist,
@@ -145,23 +146,29 @@ class _Cancelled(BaseException):
 
 
 class CancelHook(BaseHook):
-    """在下载生命周期回调点检查取消标志."""
+    """在下载生命周期回调点检查取消标志.
+
+    检测到取消时:
+    - 设置 ctx.should_continue=False 截断下游 hook 链
+    - 抛出 _Cancelled(BaseException) 让下载器停止后续分片
+    """
 
     def __init__(self, cancel_event: threading.Event) -> None:
         self._event = cancel_event
 
-    def _check(self) -> None:
+    def _check(self, ctx: HookContext) -> None:
         if self._event.is_set():
+            ctx.should_continue = False
             raise _Cancelled()
 
-    def on_playlist_parsed(self, playlist: M3U8Playlist) -> None:
-        self._check()
+    def on_playlist_parsed(self, ctx: HookContext) -> None:
+        self._check(ctx)
 
-    def on_segment(self, index: int, segment: M3U8Segment, filepath: str) -> None:
-        self._check()
+    def on_segment(self, ctx: HookContext) -> None:
+        self._check(ctx)
 
-    def on_segment_data(self, index, segment, data, filename) -> None:
-        self._check()
+    def on_segment_data(self, ctx: HookContext) -> None:
+        self._check(ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +184,8 @@ class ProgressHook(BaseHook):
         self._done = 0
         self._lock = threading.Lock()
 
-    def on_playlist_parsed(self, playlist: M3U8Playlist) -> None:
+    def on_playlist_parsed(self, ctx: HookContext) -> None:
+        playlist = ctx.playlist
         self.task.total = len(playlist)
         self.task.encrypted = playlist.is_encrypted
         self.task.emit({
@@ -188,14 +196,14 @@ class ProgressHook(BaseHook):
             "version": playlist.version,
         })
 
-    def on_segment(self, index: int, segment: M3U8Segment, filepath: str) -> None:
-        self._advance(index, uri=segment.uri)
+    def on_segment(self, ctx: HookContext) -> None:
+        self._advance(ctx.segment_index, uri=ctx.segment.uri)
 
-    def on_segment_data(self, index, segment, data, filename) -> None:
-        self._advance(index, size=len(data), filename=filename)
+    def on_segment_data(self, ctx: HookContext) -> None:
+        self._advance(ctx.segment_index, size=len(ctx.data), filename=ctx.filename)
 
-    def on_all_downloaded(self, playlist: M3U8Playlist, tmp_dir: str) -> None:
-        self.task.emit({"type": "all_downloaded", "tmp_dir": tmp_dir, "total": self.task.total})
+    def on_all_downloaded(self, ctx: HookContext) -> None:
+        self.task.emit({"type": "all_downloaded", "tmp_dir": ctx.tmp_dir, "total": self.task.total})
 
     def _advance(self, index: int, **extra) -> None:
         with self._lock:

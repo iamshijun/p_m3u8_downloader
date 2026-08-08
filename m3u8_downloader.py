@@ -306,22 +306,56 @@ class HTTPClient:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class HookContext:
+    """Hook 管道上下文, 在钩子链间传递可变数据和控制流.
+
+    Hook 可以通过修改 ctx 字段来传递数据给下游 hook, 或设置
+    should_continue=False 来截断后续 hook 的执行.
+    """
+
+    # --- 控制流 ---
+    should_continue: bool = True
+
+    # --- on_playlist_parsed ---
+    playlist: Optional[M3U8Playlist] = None
+
+    # --- on_segment / on_segment_data ---
+    segment_index: int = 0
+    segment: Optional[M3U8Segment] = None
+    filepath: str = ""
+    data: Optional[bytes] = None
+    filename: str = ""
+
+    # --- on_all_downloaded ---
+    tmp_dir: str = ""
+
+    # --- on_finish ---
+    result_path: str = ""
+
+
 class BaseHook(ABC):
-    """Hook 基类 — 生命周期钩子/回调接口方法, 子类按需覆盖."""
-    
-    def on_playlist_parsed(self, playlist: M3U8Playlist) -> None:
+    """Hook 基类 — 生命周期钩子/回调接口方法, 子类按需覆盖.
+
+    每个回调接收一个 HookContext 对象 ctx, hook 可以:
+    - 读取 ctx 中的数据进行处理
+    - 修改 ctx 字段以传递数据给下游 hook
+    - 设置 ctx.should_continue=False 截断管道
+    """
+
+    def on_playlist_parsed(self, ctx: HookContext) -> None:
         """m3u8 解析完成后调用 (在主线程中调用)."""
 
-    def on_segment(self, index: int, segment: M3U8Segment, filepath: str) -> None:
+    def on_segment(self, ctx: HookContext) -> None:
         """单个片段下载(落地到文件)+解密成功时调用 (在 worker 线程中调用)."""
 
-    def on_segment_data(self, index: int, segment: M3U8Segment, data: bytes, filename: str) -> None:
+    def on_segment_data(self, ctx: HookContext) -> None:
         """不落地模式: 直接接收字节数据 (在 worker 线程中调用)."""
 
-    def on_all_downloaded(self, playlist: M3U8Playlist, tmp_dir: str) -> None:
+    def on_all_downloaded(self, ctx: HookContext) -> None:
         """所有片段下载完成后调用 (在主线程中调用)."""
 
-    def on_finish(self, result_path: str) -> None:
+    def on_finish(self, ctx: HookContext) -> None:
         """整个流程结束后调用."""
 
 
@@ -354,11 +388,11 @@ class SegmentMergeHook(BaseHook):
         """设置 m3u8 源文件路径, 用于 no-merge 模式下拷贝到分片目录."""
         self._m3u8_file = path
 
-    def on_all_downloaded(self, playlist: M3U8Playlist, tmp_dir: str) -> None:
+    def on_all_downloaded(self, ctx: HookContext) -> None:
         if self.merge:
-            self._do_merge(tmp_dir, len(playlist))
+            self._do_merge(ctx.tmp_dir, len(ctx.playlist))
         else:
-            self._keep_segments(tmp_dir)
+            self._keep_segments(ctx.tmp_dir)
 
     def _do_merge(self, tmp_dir: str, total: int) -> None:
         """按顺序合并片段."""
@@ -394,7 +428,7 @@ class SegmentMergeHook(BaseHook):
         print(f'[*] 移动临时目录到: {output_dir}')
         shutil.move(tmp_dir, output_dir)
 
-    def on_finish(self, result_path: str) -> None:
+    def on_finish(self, ctx: HookContext) -> None:
         if not self.keep_temp and self.merge:
             # 清理临时目录 (分片已合并到 output)
             pass  # 由外部处理
@@ -431,19 +465,19 @@ class YunpanUploadHook(UploadHook):
             print(f"[!] 无法导入 yunpan_hls")
             raise
 
-    def on_playlist_parsed(self, playlist: M3U8Playlist):
-        content = playlist.to_file_content()
+    def on_playlist_parsed(self, ctx: HookContext):
+        content = ctx.playlist.to_file_content()
         print("[*] upload m3u8 to ", f"{self.remote_prefix}/playlist.m3u8")
         self._do_upload_bytes(content.encode("utf-8"), "playlist.m3u8", f"{self.remote_prefix}/playlist.m3u8")
 
-    def on_segment(self, index: int, segment: M3U8Segment, filepath: str) -> None:
-        remote_path = f"{self.remote_prefix}/{os.path.basename(filepath)}"
-        self._do_upload(filepath, remote_path)
+    def on_segment(self, ctx: HookContext) -> None:
+        remote_path = f"{self.remote_prefix}/{os.path.basename(ctx.filepath)}"
+        self._do_upload(ctx.filepath, remote_path)
 
-    def on_segment_data(self, index: int, segment: M3U8Segment, data: bytes, filename: str) -> None:
+    def on_segment_data(self, ctx: HookContext) -> None:
         """不落地模式: 直接上传 bytes."""
-        remote_path = f"{self.remote_prefix}/{SEGMENT_FILENAME_TPL.format(index)}"
-        self._do_upload_bytes(data, filename, remote_path)
+        remote_path = f"{self.remote_prefix}/{SEGMENT_FILENAME_TPL.format(ctx.segment_index)}"
+        self._do_upload_bytes(ctx.data, ctx.filename, remote_path)
 
     def _do_upload(self, local_path: str, remote_path: str) -> None:
         try:
@@ -585,8 +619,11 @@ class M3U8Downloader:
                 raise M3U8DownloadError("[!] 检测到加密片段, 但未安装 pycryptodome. 请运行: pip install pycryptodome")
             print("[*] 检测到 AES-128 加密, 密钥已加载")
             
+        ctx = HookContext(playlist=playlist)
         for hook in self.hooks:
-            hook.on_playlist_parsed(playlist)
+            hook.on_playlist_parsed(ctx)
+            if not ctx.should_continue:
+                break
 
         if not self.config.tmp_dir: #如果没有指定创建一个
             self.config.tmp_dir = tempfile.mkdtemp(prefix="m3u8_dl_")
@@ -595,8 +632,11 @@ class M3U8Downloader:
         if self.config.no_disk:
             self._download_segments_no_disk(playlist)
             result = self.config.output
+            ctx = HookContext(result_path=result)
             for hook in self.hooks:
-                hook.on_finish(result)
+                hook.on_finish(ctx)
+                if not ctx.should_continue:
+                    break
             self._cleanup()
             return result
 
@@ -608,8 +648,11 @@ class M3U8Downloader:
         segment_paths = self._download_segments(playlist)
 
         # 调用 on_all_downloaded
+        ctx = HookContext(playlist=playlist, tmp_dir=self.config.tmp_dir)
         for hook in self.hooks:
-            hook.on_all_downloaded(playlist, self.config.tmp_dir)
+            hook.on_all_downloaded(ctx)
+            if not ctx.should_continue:
+                break
 
         result_path = self._finalize()
         return result_path
@@ -642,8 +685,11 @@ class M3U8Downloader:
                 total_size_mb = os.path.getsize(self.config.output) / (1024 * 1024)
                 print(f"[*] 完成! 输出文件: {self.config.output} ({total_size_mb:.1f} MB)")
 
+        ctx = HookContext(result_path=result)
         for hook in self.hooks:
-            hook.on_finish(result)
+            hook.on_finish(ctx)
+            if not ctx.should_continue:
+                break
 
         self._cleanup()
         return result
@@ -916,8 +962,11 @@ class M3U8Downloader:
                 with open(dest, "wb") as f:
                     f.write(raw)
                 # 调用 on_segment hooks (在 worker 线程中)
+                ctx = HookContext(segment_index=index, segment=segment, filepath=dest)
                 for hook in self.hooks:
-                    hook.on_segment(index, segment, dest)
+                    hook.on_segment(ctx)
+                    if not ctx.should_continue:
+                        break
                 return (index, dest, "ok")
             except Exception as e:
                 if attempt == self.config.retries - 1:
@@ -970,8 +1019,11 @@ class M3U8Downloader:
                 if key_info is not None:
                     raw = self._decrypt(raw, key_info)
                 filename = os.path.basename(urlparse(url).path) or SEGMENT_FILENAME_TPL.format(index)
+                ctx = HookContext(segment_index=index, segment=segment, data=raw, filename=filename)
                 for hook in self.hooks:
-                    hook.on_segment_data(index, segment, raw, filename)
+                    hook.on_segment_data(ctx)
+                    if not ctx.should_continue:
+                        break
                 return (index, "ok")
             except Exception as e:
                 if attempt == self.config.retries - 1:
