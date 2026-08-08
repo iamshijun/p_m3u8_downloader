@@ -229,11 +229,21 @@ async function importTasks() {
 
   // 合并当前表单配置 + 每行解析出的 文件名/URL
   const shared = collectRequest();
-  const tasks = candidates.map(c => Object.assign({}, shared, {
-    m3u8_input: c.m3u8_input,
-    upload: c.upload,
-    line: c.line,
-  }));
+  const tasks = candidates.map(c => {
+    const task = Object.assign({}, shared);
+    task.m3u8_input = c.m3u8_input;
+    task.line = c.line;
+    // 保留表单中的上传配置 (token/ondup/max_retries/delete_after_upload)
+    // 仅将 path 替换为导入的文件名
+    if (c.upload) {
+      if (task.upload && typeof task.upload === 'object') {
+        task.upload = Object.assign({}, task.upload, { path: c.upload });
+      } else {
+        task.upload = { type: "yunpan", path: c.upload };
+      }
+    }
+    return task;
+  });
 
   $("btnImportOk").disabled = true;
   try {
