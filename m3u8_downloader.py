@@ -25,7 +25,7 @@ import time
 from abc import ABC
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, Union
 from urllib.parse import urljoin, urlparse
 
 import urllib.request
@@ -42,6 +42,11 @@ try:
 except ImportError:
     HAS_TQDM = False
 
+# M3U8DownloadError
+class M3U8DownloadError(Exception):
+    def __init__(self, message):
+       self.message = message
+       super().__init__(self.message)
 
 # ---------------------------------------------------------------------------
 # Progress Manager
@@ -268,6 +273,31 @@ class HTTPClient:
         """GET 请求, 返回响应体文本."""
         return self.get(url).decode("utf-8")
 
+    @staticmethod
+    def parse_headers(raw_headers: Optional[Union[dict[str, str], list[str], str]]) -> dict[str, str]:
+        """将 headers 输入统一解析为 dict 格式.
+
+        支持三种输入:
+        - dict[str, str]: 直接返回
+        - list[str]:  每项为 "Key: Value" 格式
+        - str:        单行 "Key: Value" 格式
+        """
+        if raw_headers is None:
+            return {}
+        if isinstance(raw_headers, dict):
+            return {k.strip(): v.strip() for k, v in raw_headers.items()}
+        if isinstance(raw_headers, str):
+            raw_headers = [raw_headers]
+
+        result: dict[str, str] = {}
+        for h in raw_headers:
+            if ":" not in h:
+                print(f"[!] 忽略无效的 Header 格式 (缺少冒号): {h}")
+                continue
+            key, _, value = h.partition(":")
+            result[key.strip()] = value.strip()
+        return result
+
 
 # ---------------------------------------------------------------------------
 # Hook system
@@ -385,7 +415,7 @@ class YunpanUploadHook(BaseHook):
             self.upload_bytes = upload_bytes
         except ImportError:
             print(f"[!] 无法导入 yunpan_hls")
-            return
+            raise 
 
     def on_playlist_parsed(self, playlist: M3U8Playlist):
         content = playlist.to_file_content()
@@ -524,8 +554,7 @@ class M3U8Downloader:
             playlist = self._resolve_master_playlist(playlist)
 
         if not playlist.segments:
-            print("[!] m3u8 文件中未找到任何视频片段")
-            sys.exit(1)
+            raise M3U8DownloadError("[!] m3u8 文件中未找到任何视频片段")
         print(f"[*] 共发现 {len(playlist)} 个视频片段")
 
         self._resolve_base_url()
@@ -533,8 +562,7 @@ class M3U8Downloader:
 
         if playlist.is_encrypted:
             if not HAS_CRYPTO:
-                print("[!] 检测到加密片段, 但未安装 pycryptodome. 请运行: pip install pycryptodome")
-                sys.exit(1)
+                raise M3U8DownloadError("[!] 检测到加密片段, 但未安装 pycryptodome. 请运行: pip install pycryptodome")
             print("[*] 检测到 AES-128 加密, 密钥已加载")
             
         for hook in self.hooks:
@@ -767,7 +795,7 @@ class M3U8Downloader:
         if urlparse(uri).netloc:
             return uri
         if self.base_url is None:
-            sys.exit(f"[!] 无法拼接相对路径 '{uri}', 未提供 base_url")
+            raise M3U8DownloadError(f"[!] 无法拼接相对路径 '{uri}', 未提供 base_url")
         return urljoin(self.base_url, uri)
 
     def _resolve_url_with_token(self, uri: str) -> str:
@@ -963,20 +991,6 @@ class M3U8Downloader:
 # ---------------------------------------------------------------------------
 
 
-def _parse_headers(raw_headers: Optional[list[str]]) -> dict[str, str]:
-    """将命令行 -H 参数解析为 headers 字典."""
-    headers: dict[str, str] = {}
-    if not raw_headers:
-        return headers
-    for h in raw_headers:
-        if ":" not in h:
-            print(f"[!] 忽略无效的 Header 格式 (缺少冒号): {h}")
-            continue
-        key, _, value = h.partition(":")
-        headers[key.strip()] = value.strip()
-    return headers
-
-
 def _load_token(token_arg: Optional[str]) -> Optional[str]:
     """获取 ACCESS_TOKEN: 命令行 > .env."""
     if token_arg:
@@ -1050,7 +1064,7 @@ def main() -> None:
             delete_after_upload=args.upload_delete,
         ))
 
-    headers = _parse_headers(args.header)
+    headers = HTTPClient.parse_headers(args.header)
     http = HTTPClient(headers=headers, proxy=args.proxy, timeout=args.timeout)
 
     downloader = M3U8Downloader(

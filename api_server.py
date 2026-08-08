@@ -40,6 +40,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
@@ -64,7 +65,6 @@ from m3u8_downloader import (
 
 MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
 DOWNLOAD_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
-TERMINAL_STATES = {"done", "error", "cancelled"}
 BATCH_LIMIT = int(os.getenv("BATCH_LIMIT", "500"))   # 单次批量导入的任务上限
 MAX_REGISTRY = int(os.getenv("MAX_REGISTRY", "2000"))  # 任务注册表最大条目数, 超过时按 finished_at 驱逐最旧
 
@@ -197,11 +197,23 @@ class ProgressHook(BaseHook):
 # ---------------------------------------------------------------------------
 
 
+class TaskStatus(Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    DONE = "done"
+    ERROR = "error"
+    CANCELLED = "cancelled"
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in (TaskStatus.DONE, TaskStatus.ERROR, TaskStatus.CANCELLED)
+
+
 @dataclass
 class Task:
     id: str
     req: DownloadRequest
-    status: str = "pending"          # pending/running/done/error/cancelled
+    status: TaskStatus = TaskStatus.PENDING
     total: int = 0
     done: int = 0
     encrypted: bool = False
@@ -236,24 +248,24 @@ class Task:
                 except queue.Full:
                     pass  # 消费者太慢, 丢弃该事件
 
-    def set_status(self, status: str, **extra) -> None:
+    def set_status(self, status: TaskStatus, **extra) -> None:
         self.status = status
-        if status == "running" and self.started_at is None:
+        if status == TaskStatus.RUNNING and self.started_at is None:
             self.started_at = time.time()
-        if status in TERMINAL_STATES:
+        if status.is_terminal:
             self.finished_at = time.time()
             # 任务结束后只保留最近 50 条事件用于回放和快照, 释放大部分历史内存
             with self._lock:
                 if len(self._history) > 50:
                     del self._history[:-50]
-        payload = {"type": "status", "status": status}
+        payload = {"type": "status", "status": status.value}
         if self.started_at is not None:
             payload["started_at"] = self.started_at
         if self.finished_at is not None:
             payload["finished_at"] = self.finished_at
         payload.update(extra)
         self.emit(payload)
-        if status in TERMINAL_STATES:
+        if status.is_terminal:
             self._close_subscribers()
             # 终态时立即释放 future 引用, 让 _run 帧和 downloader 对象可以被 GC 回收
             # 否则 future 会一直保留 _run 帧(含 M3U8Downloader / 解析后的 playlist 等)直到 TTL 清理
@@ -274,7 +286,7 @@ class Task:
         若任务已结束, 队列为 None (只需回放历史即可)."""
         with self._lock:
             history = list(self._history)
-            if self.status in TERMINAL_STATES:
+            if self.status.is_terminal:
                 return history, None
             q: "queue.Queue" = queue.Queue(maxsize=SUBSCRIBER_QUEUE_MAX)
             self._subscribers.append(q)
@@ -288,7 +300,7 @@ class Task:
     def snapshot(self) -> dict:
         return {
             "id": self.id,
-            "status": self.status,
+            "status": self.status.value,
             "input": self.req.m3u8_input,
             "output": self.result or self.req.output,
             "upload": self.req.upload,
@@ -307,18 +319,6 @@ class Task:
 # ---------------------------------------------------------------------------
 # TaskManager
 # ---------------------------------------------------------------------------
-
-
-def _parse_headers(raw_headers: Optional[list[str]]) -> dict[str, str]:
-    result: dict[str, str] = {}
-    if not raw_headers:
-        return result
-    for h in raw_headers:
-        if ":" not in h:
-            continue
-        k, _, v = h.partition(":")
-        result[k.strip()] = v.strip()
-    return result
 
 
 def _safe_name(name: str) -> str:
@@ -364,7 +364,7 @@ class TaskManager:
         task = self.get(task_id)
         if not task:
             return False
-        if task.status in TERMINAL_STATES:
+        if task.status.is_terminal:
             return False
         task.cancel_event.set()
         # 尽力取消 future: PENDING 时会成功, RUNNING 时一定返回 False (会由 _run 捕获 _Cancelled 收尾)
@@ -377,8 +377,8 @@ class TaskManager:
         # future 基本已经是 RUNNING,所以 cancel() 返回 False 是预期行为,不是异常
         # 不论 future.cancel() 结果如何, 都要把状态推进到 cancelled,
         # 否则 remove() 会因非终态而失败, 任务留在 registry 中
-        if task.status not in TERMINAL_STATES:
-            task.set_status("cancelled", reason="用户取消")
+        if not task.status.is_terminal:
+            task.set_status(TaskStatus.CANCELLED, reason="用户取消")
         return True
 
     def remove(self, task_id: str) -> bool:
@@ -386,7 +386,7 @@ class TaskManager:
             task = self._tasks.get(task_id)
             if not task:
                 return True
-            if task.status not in TERMINAL_STATES:
+            if not task.status.is_terminal:
                 return False
             del self._tasks[task_id]
         # 释放引用 辅助 GC — 必须在锁外操作避免死锁
@@ -407,14 +407,14 @@ class TaskManager:
             with self._lock:
                 stale = [
                     tid for tid, t in self._tasks.items()
-                    if t.status in TERMINAL_STATES
+                    if t.status.is_terminal
                     and t.finished_at is not None
                     and t.finished_at < cutoff
                 ]
                 # size cap: 即使 TTL 未到, 总量超限也按 finished_at 驱逐最旧的终态任务
                 if len(self._tasks) > MAX_REGISTRY:
                     terminal_sorted = sorted(
-                        [(tid, t) for tid, t in self._tasks.items() if t.status in TERMINAL_STATES],
+                        [(tid, t) for tid, t in self._tasks.items() if t.status.is_terminal],
                         key=lambda x: x[1].finished_at or 0,
                     )
                     excess = len(self._tasks) - MAX_REGISTRY
@@ -429,10 +429,10 @@ class TaskManager:
     def _run(self, task: Task) -> None:
         req = task.req
         if task.cancel_event.is_set():
-            task.set_status("cancelled", reason="启动前取消")
+            task.set_status(TaskStatus.CANCELLED, reason="启动前取消")
             return
 
-        task.set_status("running")
+        task.set_status(TaskStatus.RUNNING)
         try:
             # 每个任务独立目录, 避免输出/临时文件冲突
             task_dir = os.path.join(DOWNLOAD_ROOT, task.id)
@@ -442,14 +442,14 @@ class TaskManager:
 
             task.emit({"type": "start", "input": req.m3u8_input, "output": output_path})
 
-            headers = _parse_headers(req.headers)
+            headers = HTTPClient.parse_headers(req.headers)
             http = HTTPClient(headers=headers, proxy=req.proxy, timeout=req.timeout)
 
             no_merge = req.no_merge
             if req.no_disk:
                 if not req.upload:
                     task.error = "--no-disk 需要 --upload"
-                    task.set_status("error", message=task.error)
+                    task.set_status(TaskStatus.ERROR, message=task.error)
                     return
                 no_merge = True
 
@@ -469,7 +469,7 @@ class TaskManager:
                 token = req.upload_token or os.getenv("ACCESS_TOKEN")
                 if not token:
                     task.error = "upload 需要 upload_token 或 .env ACCESS_TOKEN"
-                    task.set_status("error", message=task.error)
+                    task.set_status(TaskStatus.ERROR, message=task.error)
                     return
                 # 下载前预检: 通过 /api/quota 验证 access_token (errno=6 = 身份认证失败),
                 # 失败立即终止, 避免浪费带宽下载一堆分片后再发现 token 失效.
@@ -480,7 +480,7 @@ class TaskManager:
                     task.emit({"type": "preflight_ok", "upload": req.upload, **info})
                 except Exception as e:
                     task.error = f"云盘预检失败: {e}"
-                    task.set_status("error", message=task.error, stage="preflight")
+                    task.set_status(TaskStatus.ERROR, message=task.error, stage="preflight")
                     return
                 hooks.append(YunpanUploadHook(
                     token=token,
@@ -512,16 +512,16 @@ class TaskManager:
             if os.path.exists(result) and os.path.isfile(result):
                 task.size = os.path.getsize(result)
             task.result = result
-            task.set_status("done", result=result, size=task.size)
+            task.set_status(TaskStatus.DONE, result=result, size=task.size)
 
         except _Cancelled:
-            task.set_status("cancelled", reason="运行中取消")
+            task.set_status(TaskStatus.CANCELLED, reason="运行中取消")
         except SystemExit as e:
             task.error = f"下载器退出: {e}"
-            task.set_status("error", message=task.error)
+            task.set_status(TaskStatus.ERROR, message=task.error)
         except Exception as e:
             task.error = str(e)
-            task.set_status("error", message=task.error, exception=type(e).__name__)
+            task.set_status(TaskStatus.ERROR, message=task.error, exception=type(e).__name__)
 
 
 manager = TaskManager(MAX_CONCURRENT)
