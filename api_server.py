@@ -36,6 +36,8 @@
     取消标志并抛出 (BaseException 派生, 绕过下载器的 except Exception 重试).
     因此取消是"尽力而为": 已在网络请求中的分片可能仍会短暂继续, 之后任务终止.
     尚未开始运行(仍在队列中)的任务可被立即取消.
+    注意: 下载器在取消/异常时不会等待线程池排干 (不再把剩余分片全部下载完),
+    已提交未执行的分片会被取消, 因此取消后 CPU/带宽占用会立即回落.
 """
 
 from __future__ import annotations
@@ -237,6 +239,10 @@ class CancelHook(BaseHook):
         self._check(ctx)
 
     def on_segment_data(self, ctx: HookContext) -> None:
+        self._check(ctx)
+
+    def on_all_downloaded(self, ctx: HookContext) -> None:
+        # 所有分片下载完但尚未合并时, 取消请求也要生效 (否则合并会照常跑完并标记 done)
         self._check(ctx)
 
 
@@ -542,6 +548,9 @@ class TaskManager:
             os.makedirs(task_dir, exist_ok=True)
             output_path = os.path.join(task_dir, _safe_name(req.output))
             tmp_dir = os.path.join(task_dir, "tmp")
+            # 必须显式创建: 下载器对已指定 tmp_dir 的配置不会再 mkdtemp,
+            # 不创建的话每个分片写入都会 FileNotFoundError, 任务全部失败
+            os.makedirs(tmp_dir, exist_ok=True)
 
             task.emit({"type": "start", "input": req.m3u8_input, "output": output_path})
 
@@ -614,6 +623,12 @@ class TaskManager:
             )
 
             result = downloader.run()
+
+            # 取消可能在下载收尾阶段 (全部下载完但未合并/收尾) 才生效,
+            # 此时不应把任务标记为 done, 避免已取消的任务显示为成功
+            if task.cancel_event.is_set():
+                task.set_status(TaskStatus.CANCELLED, reason="运行中取消")
+                return
 
             if os.path.exists(result) and os.path.isfile(result):
                 task.size = os.path.getsize(result)

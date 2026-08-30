@@ -260,20 +260,32 @@ class HTTPClient:
         if self.headers:
             print(f"[*] 自定义请求头: {self.headers}")
 
-    def get(self, url: str) -> bytes:
-        """GET 请求, 返回响应体字节."""
+    def get(self, url: str, max_bytes: Optional[int] = None) -> bytes:
+        """GET 请求, 返回响应体字节.
+
+        max_bytes 非 None 时限制响应体大小 (超出抛 M3U8DownloadError),
+        用于 m3u8 列表这类本该很小的响应, 防止超大文件被整体读入内存.
+        """
+        def _read(resp):
+            if max_bytes is not None:
+                data = resp.read(max_bytes + 1)
+                if len(data) > max_bytes:
+                    raise M3U8DownloadError(f"[!] 响应体超过上限 {max_bytes} 字节")
+                return data
+            return resp.read()
+
         has_extra = (self._opener is not None) or bool(self.headers)
         if has_extra:
             req = urllib.request.Request(url, headers=self.headers)
             with (self._opener or urllib.request.build_opener()).open(req, timeout=self.timeout) as resp:
-                return resp.read()
+                return _read(resp)
         else:
             with urllib.request.urlopen(url, timeout=self.timeout) as resp:
-                return resp.read()
+                return _read(resp)
 
-    def get_text(self, url: str) -> str:
+    def get_text(self, url: str, max_bytes: Optional[int] = None) -> str:
         """GET 请求, 返回响应体文本."""
-        return self.get(url).decode("utf-8")
+        return self.get(url, max_bytes=max_bytes).decode("utf-8")
 
     @staticmethod
     def parse_headers(raw_headers: Optional[Union[dict[str, str], list[str], str]]) -> dict[str, str]:
@@ -545,6 +557,10 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 )
 
+# m3u8 播放列表是几 KB ~ 几 MB 的文本; 超过该上限说明输入被误传为视频直链等,
+# 直接拒绝, 避免把超大文件整体读入内存 (取消也无法中断读取).
+MAX_PLAYLIST_BYTES = 20 * 1024 * 1024
+
 
 @dataclass
 class DownloadConfig:
@@ -700,7 +716,7 @@ class M3U8Downloader:
         """获取 m3u8 内容 (支持 URL 或本地文件) 并解析."""
         if urlparse(self.config.m3u8_source).scheme in ("http", "https"):
             print(f"[*] 下载 m3u8 文件: {self.config.m3u8_source}")
-            content = self.http.get_text(self.config.m3u8_source)
+            content = self.http.get_text(self.config.m3u8_source, max_bytes=MAX_PLAYLIST_BYTES)
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".m3u8", delete=False, encoding="utf-8"
             ) as tmp:
@@ -727,7 +743,7 @@ class M3U8Downloader:
         variant_url = self._resolve_url(best.uri)
         print(f"[*] 获取变体 m3u8: {variant_url}")
 
-        content = self.http.get_text(variant_url)
+        content = self.http.get_text(variant_url, max_bytes=MAX_PLAYLIST_BYTES)
 
         # 用变体 m3u8 内容替换 _tmp_m3u8_path (供 no-merge 模式拷贝 playlist.m3u8)
         if self._tmp_m3u8_path and os.path.exists(self._tmp_m3u8_path):
@@ -908,7 +924,12 @@ class M3U8Downloader:
     # -- download ------------------------------------------------------------
 
     def _download_segments(self, playlist: M3U8Playlist) -> list[str]:
-        """并发下载所有片段 (含解密 + on_segment hook)."""
+        """并发下载所有片段 (含解密 + on_segment hook).
+
+        取消/异常时立即放弃剩余分片: 不再用 `with ThreadPoolExecutor` 隐式
+        shutdown(wait=True) 等待全部任务跑完 (那会让取消后仍把整份列表下载完,
+        CPU/带宽持续被打满). 改为手动管理, finally 中取消未执行的分片并不等待.
+        """
         urls = [self._resolve_url(seg.uri) for seg in playlist.segments]
         print(f"[*] 开始下载 (并发数: {self.config.workers})...")
 
@@ -917,9 +938,10 @@ class M3U8Downloader:
         fail = 0
         total = len(playlist)
 
-        with ProgressBar(total=total, desc="下载进度", unit="seg", quiet=self.config.quiet) as pbar:
-            with ThreadPoolExecutor(max_workers=self.config.workers) as executor:
-                futures = {}
+        executor = ThreadPoolExecutor(max_workers=self.config.workers)
+        futures: dict = {}
+        try:
+            with ProgressBar(total=total, desc="下载进度", unit="seg", quiet=self.config.quiet) as pbar:
                 for i, url in enumerate(urls):
                     #统一为6位的seg片段标识
                     dest = os.path.join(self.config.tmp_dir, SEGMENT_FILENAME_TPL.format(i))
@@ -939,6 +961,13 @@ class M3U8Downloader:
 
                     if not pbar.update(1):
                         pbar.log_progress(success + fail, total, success, fail)
+        finally:
+            # 关键: 不等待执行器排干. 已提交未执行的分片直接取消(不再下载),
+            # 正在执行的至多 workers 个线程跑完当前分片后自然退出 (取消时它们
+            # 会在 hook 处抛出 _Cancelled 立即结束).
+            for fut in futures:
+                fut.cancel()
+            executor.shutdown(wait=False)
 
         if fail > 0:
             print(f"[!] {fail} 个片段下载失败, 合并结果可能不完整")
@@ -954,7 +983,8 @@ class M3U8Downloader:
         key_info: Optional[KeyInfo] = None,
     ) -> tuple[int, str, str]:
         """下载单个片段, 失败自动重试, 支持解密 + on_segment hook."""
-        for attempt in range(self.config.retries):
+        attempts = max(1, self.config.retries)  # 0 表示只尝试一次, 而不是一次都不试
+        for attempt in range(attempts):
             try:
                 raw = self.http.get(url)
                 if key_info is not None:
@@ -969,22 +999,27 @@ class M3U8Downloader:
                         break
                 return (index, dest, "ok")
             except Exception as e:
-                if attempt == self.config.retries - 1:
+                if attempt == attempts - 1:
                     return (index, "", f"失败: {e}")
                 time.sleep(1 * (attempt + 1))
         return (index, "", "unknown error")
 
     def _download_segments_no_disk(self, playlist: M3U8Playlist) -> None:
-        """不落地下载: 下载解密后直接 on_segment_data, 不写磁盘."""
+        """不落地下载: 下载解密后直接 on_segment_data, 不写磁盘.
+
+        取消/异常时立即放弃剩余分片, 理由同 _download_segments (否则取消后
+        整份列表仍会全部下载+解密+上传, CPU/带宽持续被打满).
+        """
         urls = [self._resolve_url(seg.uri) for seg in playlist.segments]
         print(f"[*] 开始不落地下载 (并发数: {self.config.workers})...")
         total = len(playlist)
         success = 0
         fail = 0
 
-        with ProgressBar(total=total, desc="下载&上传", unit="seg", quiet=self.config.quiet) as pbar:
-            with ThreadPoolExecutor(max_workers=self.config.workers) as executor:
-                futures = {}
+        executor = ThreadPoolExecutor(max_workers=self.config.workers)
+        futures: dict = {}
+        try:
+            with ProgressBar(total=total, desc="下载&上传", unit="seg", quiet=self.config.quiet) as pbar:
                 for i, url in enumerate(urls):
                     seg = playlist.segments[i]
                     futures[executor.submit(
@@ -1001,6 +1036,11 @@ class M3U8Downloader:
 
                     if not pbar.update(1):
                         pbar.log_progress(success + fail, total, success, fail)
+        finally:
+            # 不等待执行器排干, 取消/异常时剩余分片不再下载
+            for fut in futures:
+                fut.cancel()
+            executor.shutdown(wait=False)
 
         if fail > 0:
             print(f"[!] {fail} 个片段失败")
@@ -1013,7 +1053,8 @@ class M3U8Downloader:
         key_info: Optional[KeyInfo] = None,
     ) -> tuple[int, str]:
         """下载 + 解密 + on_segment_data (不写磁盘)."""
-        for attempt in range(self.config.retries):
+        attempts = max(1, self.config.retries)  # 0 表示只尝试一次, 而不是一次都不试
+        for attempt in range(attempts):
             try:
                 raw = self.http.get(url)
                 if key_info is not None:
@@ -1026,7 +1067,7 @@ class M3U8Downloader:
                         break
                 return (index, "ok")
             except Exception as e:
-                if attempt == self.config.retries - 1:
+                if attempt == attempts - 1:
                     return (index, f"失败: {e}")
                 time.sleep(1 * (attempt + 1))
         return (index, "unknown error")
