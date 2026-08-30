@@ -204,7 +204,7 @@ def create_parser():
     # Positional argument - M3U8 URL or file path
     parser.add_argument("m3u8_input", help="M3U8 file path or URL")
     parser.add_argument("--upload", "-u", default=None, metavar="REMOTE_DIR",
-                        help="上传到百度云盘, 后跟远程目录路径, 如 /apps/movies/my_video/")
+                        help="上传到百度云盘, 后跟远程目录路径, 如 /apps/{app_name}/movies/my_video/ app_name为你的应用名称")
     # Options
     parser.add_argument("--config", action="store_true",
                        help="Show current domain configuration")

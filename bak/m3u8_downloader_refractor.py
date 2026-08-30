@@ -11,7 +11,7 @@ M3U8 视频下载 & 合并工具 (支持 AES-128 解密 + Hook 插件机制)
     python m3u8_downloader.py https://example.com/playlist.m3u8 --no-merge -o my_video
     # 下载并上传到百度云盘
     python m3u8_downloader.py video.m3u8 --base-url https://example.com/video/ --no-disk \\
-        --upload /apps/movies/my_video/ --upload-token YOUR_TOKEN
+        --upload /apps/{app_name}movies/my_video/ --upload-token YOUR_TOKEN
 """
 
 import argparse

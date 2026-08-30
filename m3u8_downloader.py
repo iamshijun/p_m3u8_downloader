@@ -11,7 +11,7 @@ M3U8 视频下载 & 合并工具 (支持 AES-128 解密 + Hook 插件机制)
     python m3u8_downloader.py https://example.com/playlist.m3u8 --no-merge -o my_video
     # 下载并上传到百度云盘
     python m3u8_downloader.py video.m3u8 --base_url https://example.com/video/ -no-disk \
-        --upload /apps/movies/my_video/ --upload-token YOUR_TOKEN
+        --upload /apps/{app_name}/movies/my_video/ --upload-token YOUR_TOKEN
 """
 
 import argparse
@@ -1096,7 +1096,7 @@ def main() -> None:
 
     # --upload 选项组 需要根据 hls_yunpan的upload模块的参数来做传递/适配
     parser.add_argument("--upload", "-u", default=None, metavar="REMOTE_DIR",
-                        help="上传到百度云盘, 后跟远程目录路径, 如 /apps/movies/my_video/")
+                        help="上传到百度云盘, 后跟远程目录路径, 如 /apps/asitanokibou/movies/my_video/")
     parser.add_argument("--upload-token", default=None, help="百度 ACCESS_TOKEN (默认从 .env 读取)")
     parser.add_argument("--upload-ondup", default="overwrite", choices=["fail", "overwrite", "newcopy"],
                         help="云端冲突策略 (默认: overwrite)")

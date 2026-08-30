@@ -6,10 +6,10 @@ Baidu Yunpan upload tool (standalone CLI).
     python -m app.upload video.ts --retries 5
 
     # Directory with resume, 5 parallel workers
-    python -m app.upload ./my_videos /apps/movies/my_videos -w 5
+    python -m app.upload ./my_videos /apps/{app_name}movies/my_videos -w 5
 
     # Skip files larger than 100MB
-    python -m app.upload ./my_videos /apps/movies/my_videos --max-size 100MB
+    python -m app.upload ./my_videos /apps/{app_name}movies/my_videos --max-size 100MB
 
     # Keep local file after upload
     python -m app.upload video.ts --no-delete-after-upload
@@ -35,7 +35,7 @@ from tqdm import tqdm
 # ── Constants ──────────────────────────────────────────────────────────────
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_ENV_FILE = PROJECT_ROOT / ".env"
-DEFAULT_REMOTE_PREFIX = "/apps/movies"
+DEFAULT_REMOTE_PREFIX = "/apps/asitanokibou/movies"
 UPLOAD_URL = "https://d.pcs.baidu.com/rest/2.0/pcs/file"
 PROGRESS_FILENAME = ".yunpan_upload_progress.json"
 
@@ -609,16 +609,16 @@ def build_parser() -> argparse.ArgumentParser:
 Examples:
   # Single file
   python -m app.upload video.ts
-  python -m app.upload video.ts -r /apps/movies/my-video.ts --retries 5
+  python -m app.upload video.ts -r /apps/asitanokibou/movies/my-video.ts --retries 5
 
   # Directory with resume + 5 parallel workers
-  python -m app.upload ./my_videos -r /apps/movies/my_videos -w 5
+  python -m app.upload ./my_videos -r /apps/asitanokibou/movies/my_videos -w 5
 
   # Directory — no resume, overwrite existing files
-  python -m app.upload ./my_videos -r /apps/movies/my_videos --no-resume -o overwrite
+  python -m app.upload ./my_videos -r /apps/asitanokibou/movies/my_videos --no-resume -o overwrite
 
   # Skip files larger than 100MB
-  python -m app.upload ./my_videos -r /apps/movies/my_videos --max-size 100MB
+  python -m app.upload ./my_videos -r /apps/asitanokibou/movies/my_videos --max-size 100MB
 
   # Skip files larger than 1GB
   python -m app.upload ./large_files -r /apps/large --max-size 1GB

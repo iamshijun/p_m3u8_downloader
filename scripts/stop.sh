@@ -1,87 +1,49 @@
 #!/usr/bin/env bash
-# 停止 m3u8 API 服务 (优雅停止, 超时强杀)
+# 停止由 start.sh 后台模式启动的 m3u8 API 服务 (对齐 movie_api 简化版).
 #
-# 用法:
-#   ./scripts/stop.sh                   # 等待最多 15s
-#   ./scripts/stop.sh --force           # 立即 SIGKILL
-#   ./scripts/stop.sh --timeout=30      # 自定义优雅停止超时秒数
+# 用法:  ./scripts/stop.sh        (无参数)
 #
-# 退出码:
-#   0  正常停止 (或不需停止)
-#   1  启动但未停止
-#   2  参数错误
+# 流程: 读 run/server.pid → 先杀子进程再杀主进程 (SIGTERM) → 0.1s × 50 轮询 (5s)
+#       → 超时 SIGKILL → 清理 pid 文件. 任何分支都 exit 0 (幂等, 适合 restart/CI).
+#
+# 注意: start.sh foreground 前台实例不写 pid 文件, 不受本脚本管理 (用 Ctrl-C 停止).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-
 PID_FILE="$PROJECT_DIR/run/server.pid"
 
-FORCE=0
-TIMEOUT=15
-for arg in "$@"; do
-    case "$arg" in
-        --force|-f) FORCE=1 ;;
-        --timeout=*) TIMEOUT="${arg#--timeout=}" ;;
-        --help|-h)
-            sed -n '2,12p' "$0"; exit 0 ;;
-        *) echo "未知参数: $arg" >&2; exit 2 ;;
-    esac
-done
-
-if ! [[ "$TIMEOUT" =~ ^[0-9]+$ ]] || [[ "$TIMEOUT" -lt 1 ]]; then
-    echo "--timeout 必须是正整数" >&2
-    exit 2
-fi
-
 if [[ ! -f "$PID_FILE" ]]; then
-    echo "服务未运行 (无 pid 文件: $PID_FILE)"
+    echo "[stop] 未找到 $PID_FILE, 服务可能未在运行"
     exit 0
 fi
 
 PID="$(cat "$PID_FILE" 2>/dev/null || true)"
 if [[ -z "$PID" ]] || ! kill -0 "$PID" 2>/dev/null; then
-    echo "pid $PID 已不存在, 清理 pid 文件"
+    echo "[stop] 服务未在运行 (PID: ${PID:-未知})"
     rm -f "$PID_FILE"
     exit 0
 fi
 
-# 找出 uvicorn 子进程 (api_server 用 uvicorn.run 启动) 一并 kill
-# 避免主进程退出后端口仍被 worker 占用
-PIDS_TO_KILL="$PID"
-CHILD_PIDS="$(pgrep -P "$PID" 2>/dev/null | tr '\n' ' ' || true)"
-if [[ -n "$CHILD_PIDS" ]]; then
-    PIDS_TO_KILL="$PIDS_TO_KILL $CHILD_PIDS"
-fi
+echo "[stop] 停止服务 PID: $PID"
 
-echo "发送 SIGTERM 到: $PIDS_TO_KILL"
-kill -TERM $PIDS_TO_KILL 2>/dev/null || true
+# 先停子进程再停主进程, 避免主进程退出后端口仍被子进程占用
+pkill -TERM -P "$PID" 2>/dev/null || true
+kill -TERM "$PID" 2>/dev/null || true
 
-if [[ "$FORCE" -eq 1 ]]; then
-    sleep 1
-else
-    # 等待优雅退出
-    WAITED=0
-    while [[ "$WAITED" -lt "$TIMEOUT" ]]; do
-        if ! kill -0 "$PID" 2>/dev/null; then
-            break
-        fi
-        sleep 1
-        WAITED=$((WAITED + 1))
-    done
-
-    if kill -0 "$PID" 2>/dev/null; then
-        echo "等待 ${TIMEOUT}s 未退出, 发送 SIGKILL"
-        kill -9 $PIDS_TO_KILL 2>/dev/null || true
-        sleep 1
+for _ in $(seq 1 50); do
+    if ! kill -0 "$PID" 2>/dev/null; then
+        break
     fi
-fi
+    sleep 0.1
+done
 
 if kill -0 "$PID" 2>/dev/null; then
-    echo "停止失败, pid=$PID 仍在运行" >&2
-    exit 1
+    echo "[stop] 优雅停止超时 (5s), 强制结束"
+    pkill -KILL -P "$PID" 2>/dev/null || true
+    kill -KILL "$PID" 2>/dev/null || true
 fi
 
 rm -f "$PID_FILE"
-echo "服务已停止 (pid=$PID)"
+echo "[stop] 已停止"
 exit 0

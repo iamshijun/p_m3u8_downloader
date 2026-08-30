@@ -59,9 +59,10 @@ Domain configuration is stored in `domain_config.{json,toml}`. The script tries 
 A FastAPI wrapper that exposes `m3u8_downloader` as an HTTP service with a multi-task queue and streaming progress. It **imports** `M3U8Downloader` / hooks as a library and does not modify the downloader.
 
 ```bash
-pip install fastapi uvicorn        # extra deps (see requirements.txt)
-python3 api_server.py              # or: uvicorn api_server:app --host 0.0.0.0 --port 8000
-# open http://localhost:8000/
+./scripts/start.sh                 # background (auto .venv + pip sync, writes run/server.pid)
+./scripts/start.sh foreground      # foreground (Ctrl-C to stop, no pid file)
+python3 api_server.py              # direct run — all three read the project-root .env
+# open http://localhost:8011/      (PORT from .env, default 8000)
 ```
 
 Endpoints:
@@ -82,49 +83,70 @@ GET    /api/health              — health check + max_concurrent
 GET    /                         — serves web/index.html (StaticFiles)
 ```
 
+### Configuration
+
+`api_server.py` loads the project-root `.env` at import time (`_load_env_file()`; shell scripts only parse `.env` for display/port probing). Priority: **environment variable > `.env` > code default**. Copy `.env.example` to start:
+
+| Key | Default | Purpose |
+|---|---|---|
+| `HOST` / `PORT` | `0.0.0.0` / `8000` | uvicorn bind address (read by `api_server.py`, not the shell scripts) |
+| `MAX_CONCURRENT_DOWNLOADS` | `3` | ThreadPoolExecutor size |
+| `BATCH_LIMIT` | `500` | per-batch task limit on `/api/download/batch` |
+| `MAX_REGISTRY` | `2000` | registry cap; evicts oldest terminal tasks beyond it |
+| `TASK_TTL_SECONDS` | `1800` | how long terminal tasks stay in the registry |
+| `ACCESS_TOKEN` | — | fallback upload token when a task doesn't pass `upload.token` |
+
+`_load_env_file()` prefers python-dotenv and falls back to a hand-rolled parser with `setdefault` semantics (existing env vars win), so `python3 api_server.py` works even on interpreters without python-dotenv.
+
 Key design points:
+- **`.env` loading**: `_load_env_file()` runs **before** the config constants, so every `os.getenv`-backed setting (`MAX_CONCURRENT_DOWNLOADS`/`BATCH_LIMIT`/`MAX_REGISTRY`/`TASK_TTL_SECONDS`/`HOST`/`PORT`/`ACCESS_TOKEN`) also reads `.env`; the `ACCESS_TOKEN` fallback no longer depends on the shell pre-sourcing `.env`.
 - **Concurrency**: global `ThreadPoolExecutor(max_workers=MAX_CONCURRENT)`; excess tasks wait as `pending`. Tunable via env `MAX_CONCURRENT_DOWNLOADS` (default 3).
 - **Task model**: `Task` holds status (`pending/running/done/error/cancelled`), progress, event history, subscriber queues, and a `cancel_event`. `TaskManager` owns the registry + executor.
 - **Output isolation**: each task writes to `downloads/{task_id}/`; `_safe_name()` sanitizes the basename to prevent path traversal and filename collisions between concurrent tasks.
 - **Progress**: `ProgressHook` (subclass of `BaseHook`) forwards `on_playlist_parsed / on_segment / on_segment_data / on_all_downloaded` into the task's event queue; `set_status()` broadcasts terminal states.
 - **Streaming/subscribe**: `Task.subscribe()` snapshots history and registers a queue under a lock (no lost/duplicate events); terminal state pushes a `None` sentinel to close streams. Reconnecting or opening a new tab replays history.
 - **Cancellation**: the downloader has no built-in cancel point. `CancelHook` checks `cancel_event` in segment callbacks and raises `_Cancelled(BaseException)` — deriving from `BaseException` (not `Exception`) bypasses the downloader's `except Exception` retry loop. Queued (not-yet-started) tasks are cancelled immediately via `future.cancel()`; running tasks are best-effort (in-flight segments may finish first).
+- **`__main__`**: passes the `app` object (not the `"api_server:app"` string) to `uvicorn.run` — the string form makes uvicorn re-import the module as `api_server`, executing the module-level `manager = TaskManager(...)` twice (two thread pools + two cleanup threads, the `__main__` copy a pure leak).
 - **Note**: the task registry is in-memory; a server restart loses task records (files under `downloads/` remain).
 
 
 ## Service scripts (`scripts/*.sh`)
 
-Shell scripts to run the FastAPI service as a background process (Linux only; Windows is not supported):
+Shell scripts to run the FastAPI service (structure aligned with `movie_api`; Linux/macOS; Windows is not supported):
 
 ```bash
-./scripts/start.sh                  # start in background (writes run/server.pid, run/server.log)
-./scripts/stop.sh                   # graceful stop: SIGTERM → wait 15s → SIGKILL
-./scripts/stop.sh --force           # skip graceful, SIGKILL immediately
-./scripts/stop.sh --timeout=30      # custom graceful timeout in seconds
-./scripts/restart.sh                # stop + start (forwards env / args to start.sh)
+./scripts/start.sh                  # background: auto .venv + pip sync + nohup (writes run/server.pid, run/server.log)
+./scripts/start.sh foreground       # foreground: exec .venv/bin/python api_server.py (Ctrl-C to stop; no pid file; -f/--foreground 同义)
+./scripts/stop.sh                   # stop: SIGTERM children+parent → poll 5s → SIGKILL; always exit 0 (no arguments)
+./scripts/restart.sh                # stop + start (forwards env / args to start.sh; `restart.sh foreground` works)
 ./scripts/status.sh                 # show pid, elapsed time, listener on PORT
 tail -f run/server.log              # follow logs
 ```
 
-Environment variables (optional, consumed by `start.sh` / `restart.sh`):
-- `HOST` — listen address (default `0.0.0.0`)
-- `PORT` — listen port (default `8000`)
-- `MAX_CONCURRENT` — concurrent downloads (default `3`, forwarded as `MAX_CONCURRENT_DOWNLOADS`)
-- `PYTHON` — interpreter (default `python3`)
+Environment variables (optional):
+- `HOST` / `PORT` — read by `api_server.py` itself (priority: env > `.env` > default `0.0.0.0:8000`); the scripts only reuse them for display and port probing
+- `MAX_CONCURRENT` — forwarded to `MAX_CONCURRENT_DOWNLOADS` **only when explicitly set** (an unconditional default would override `.env`'s value)
+- `PYTHON` — bootstrap interpreter for creating `.venv` (default `python3`)
+- `SKIP_PIP` — set `1` to skip the per-start dependency sync
+
+venv:
+- `start.sh` creates `.venv` if missing (`$PYTHON -m venv`), then runs `pip install -r requirements.txt` on every start (idempotent); a failed sync is only a warning (network blips shouldn't block restarts), followed by a hard `import fastapi, uvicorn` check
+- launch command: `.venv/bin/python api_server.py` — the app decides HOST/PORT; the uvicorn CLI is not used
 
 Layout:
-- `run/server.pid` — main process pid; `stop.sh` also walks `pgrep -P` to kill the uvicorn worker, so the port is released even when the main process has already exited
+- `run/server.pid` — background-mode pid; `stop.sh` kills children first (`pkill -P`) then the parent, so the port is released even when a child holds it
 - `run/server.log` — combined stdout + stderr, appended
 - `run/` is git-ignored
+- `stop.sh` only manages background instances: foreground runs don't write a pid file — stop them with Ctrl-C
 
 Exit codes (suitable for `systemctl` / CI):
-- `start.sh` — `0` started; `1` already running / port busy / missing deps / process exited within 1s
-- `stop.sh` — `0` stopped or no-op; `1` still running; `2` bad arguments
+- `start.sh` — `0` started; `1` already running / process exited within 1s (log tail printed); `2` bad arguments
+- `stop.sh` — always `0` (stopped or no-op, idempotent). Graceful window is 5s (0.1s × 50 polling) before SIGKILL — with active downloads / open NDJSON streams it will usually SIGKILL; the task registry is in-memory, so nothing durable is lost
 - `status.sh` — `0` running; `1` stale pid; `3` not running
 
-Port check: `start.sh` runs `ss` / `lsof` / `netstat` (whichever exists) against `$PORT` before launching. If busy it prints the occupying process and exits 1 — no pid file is written, no process spawned.
+Port check: `start.sh` probes `$PORT` (via `scripts/_common.sh` `port_in_use`: ss → lsof → netstat, whichever exists) and only **warns** if busy — the shell-side PORT is a coarse parse of `.env` and doesn't own the veto; the real verdict is the post-launch `kill -0` liveness check + log tail.
 
-Launch: both `start.sh` and the systemd unit invoke `python3 -m uvicorn api_server:app --host ... --port ...` instead of `python3 api_server.py`. The latter hard-codes `0.0.0.0:8000` and ignores `HOST`/`PORT`; uvicorn-CLI honors them.
+Launch: `start.sh` runs `.venv/bin/python api_server.py` (the app reads HOST/PORT from env/`.env` itself). The systemd unit still invokes `python3 -m uvicorn api_server:app --host ... --port ...` with the system python — unchanged here, it relies on its own `EnvironmentFile` + shell expansion.
 
 ### systemd deployment (production / server)
 

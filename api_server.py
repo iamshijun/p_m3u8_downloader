@@ -1,9 +1,20 @@
 """FastAPI 服务: 封装 m3u8_downloader 提供多任务下载 + 流式进度接口.
 
 启动:
-    pip install fastapi uvicorn
-    python3 api_server.py
-    # 或 uvicorn api_server:app --host 0.0.0.0 --port 8000
+    ./scripts/start.sh              # 后台 (自动建 .venv + 装依赖, 写 run/server.pid)
+    ./scripts/start.sh foreground   # 前台 (Ctrl-C 停止, 不写 pid 文件)
+    python3 api_server.py           # 直跑 (读项目根 .env 的 HOST/PORT)
+
+    三种方式都会加载项目根 .env (推荐从 .env.example 复制).
+
+配置优先级: 环境变量 > 项目根 .env > 代码默认值. 可用键:
+    HOST                       监听地址 (默认 0.0.0.0)
+    PORT                       监听端口 (默认 8000)
+    MAX_CONCURRENT_DOWNLOADS   同时运行的下载任务数 (默认 3)
+    BATCH_LIMIT                单次批量导入任务上限 (默认 500)
+    MAX_REGISTRY               任务注册表最大条目数 (默认 2000)
+    TASK_TTL_SECONDS           已结束任务保留时间 (默认 1800)
+    ACCESS_TOKEN               上传后端未显式传 token 时的兜底 token
 
 接口:
     POST   /api/download              → 创建下载任务, 返回 {task_id}
@@ -18,7 +29,7 @@
 
 并发:
     全局 ThreadPoolExecutor(max_workers=MAX_CONCURRENT) 控制同时运行的任务数,
-    超出的任务在队列中等待 (状态 pending). 环境变量 MAX_CONCURRENT_DOWNLOADS 可调.
+    超出的任务在队列中等待 (状态 pending). MAX_CONCURRENT_DOWNLOADS 可调 (env/.env).
 
 取消:
     m3u8_downloader 内部不提供取消点, 本服务通过 CancelHook 在每个分片回调时检查
@@ -63,14 +74,72 @@ from m3u8_downloader import (
 )
 
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+ENV_FILE = os.path.join(BASE_DIR, ".env")
+
+
+def _load_env_file(path: str = ENV_FILE) -> None:
+    """把项目根 .env 注入 os.environ (setdefault 语义: 已存在的环境变量优先).
+
+    优先级: 环境变量 > .env > 代码默认值. 优先用 python-dotenv (requirements.txt
+    已含, 与 m3u8_downloader._load_token / pan_upload 一致); 未安装时退回手写解析,
+    保证没装第三方包的解释器上 python3 api_server.py 也能读到 .env.
+    """
+    if not os.path.isfile(path):
+        return
+    try:
+        from dotenv import load_dotenv
+        load_dotenv(dotenv_path=path, override=False)
+        return
+    except ImportError:
+        pass
+    with open(path, "r", encoding="utf-8") as fp:
+        for raw in fp:
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, val = line.partition("=")
+            key = key.strip()
+            if key.startswith("export "):
+                key = key[len("export "):].strip()
+            if not key:
+                continue
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                val = val[1:-1]                      # 引号内原样保留
+            else:
+                val = val.split(" #", 1)[0].strip()  # 裸值: 去行尾注释
+            os.environ.setdefault(key, val)
+
+
+_load_env_file()
+
+
+def _env_int(name: str, default: int) -> int:
+    """读整型环境变量; 空/非法回退默认值并告警 (.env 是人工编辑的)."""
+    raw = os.getenv(name)
+    if raw is None or raw.strip() == "":
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        print(f"[warn] {name}={raw!r} 不是整数, 回退 {default}")
+        return default
+
+
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
 
-MAX_CONCURRENT = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
-DOWNLOAD_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "downloads")
-BATCH_LIMIT = int(os.getenv("BATCH_LIMIT", "500"))   # 单次批量导入的任务上限
-MAX_REGISTRY = int(os.getenv("MAX_REGISTRY", "2000"))  # 任务注册表最大条目数, 超过时按 finished_at 驱逐最旧
+MAX_CONCURRENT = _env_int("MAX_CONCURRENT_DOWNLOADS", 3)
+DOWNLOAD_ROOT = os.path.join(BASE_DIR, "downloads")
+BATCH_LIMIT = _env_int("BATCH_LIMIT", 500)   # 单次批量导入的任务上限
+MAX_REGISTRY = _env_int("MAX_REGISTRY", 2000)  # 任务注册表最大条目数, 超过时按 finished_at 驱逐最旧
+
+# 监听地址/端口. 优先级: 环境变量 > .env > 此处默认值.
+# 用 `or` 而非 getenv 的 default: .env 写 `HOST=`(空值) 时也回退默认, 避免 bind ""
+HOST = os.getenv("HOST") or "0.0.0.0"
+PORT = _env_int("PORT", 8000)
 
 # 内存控制常量
 HISTORY_MAX = 200              # 每个任务保留的最大事件数（超出则丢弃旧事件）
@@ -724,4 +793,8 @@ if os.path.isdir(_WEB_DIR):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("api_server:app", host="0.0.0.0", port=8000, reload=False)
+    # 传 app 对象而非 "api_server:app" 字符串: 字符串形式会让 uvicorn 以
+    # "api_server" 之名二次 import 本模块, 模块级的 manager = TaskManager(...)
+    # 会执行两遍 —— 两个线程池 + 两个清理线程, __main__ 那份纯泄漏.
+    print(f"[run] http://{HOST}:{PORT}")
+    uvicorn.run(app, host=HOST, port=PORT)

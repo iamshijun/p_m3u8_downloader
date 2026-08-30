@@ -13,6 +13,10 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 PID_FILE="$PROJECT_DIR/run/server.pid"
 LOG_FILE="$PROJECT_DIR/run/server.log"
 
+ENV_FILE="$PROJECT_DIR/.env"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/_common.sh"
+
 if [[ ! -f "$PID_FILE" ]]; then
     echo "状态: 未运行 (无 pid 文件)"
     exit 3
@@ -37,11 +41,16 @@ echo "  cmd    : $(ps -o command= -p "$PID" 2>/dev/null || echo '?')"
 echo "  详情   : $PS_LINE"
 echo "  日志   : $LOG_FILE"
 
-# 端口探测 (可选)
+# 端口探测 (PORT 解析与 start.sh 同一套: 环境变量 > .env > 默认 8000; 真正的监听地址由 api_server.py 决定)
+PORT="${PORT:-$(env_get PORT)}"
 PORT="${PORT:-8000}"
-if command -v ss >/dev/null 2>&1; then
-    LISTEN="$(ss -ltnp 2>/dev/null | grep -E "[:.]${PORT}\\b" || true)"
-    [[ -n "$LISTEN" ]] && echo "  端口 $PORT: $LISTEN"
+if port_in_use "$PORT"; then
+    echo "  端口 $PORT: LISTEN"
+    if command -v lsof >/dev/null 2>&1; then
+        lsof -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | tail -n +2 | sed 's/^/    /' || true
+    fi
+else
+    echo "  端口 $PORT: 未监听 (可能仍在启动中, 或 shell 侧 PORT 与实际配置不一致)"
 fi
 
 exit 0
