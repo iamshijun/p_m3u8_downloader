@@ -185,6 +185,7 @@ class DownloadRequest(BaseModel):
     headers: Optional[list[str]] = Field(None, description="自定义请求头, 格式 Key:Value")
     key_param: Optional[str] = Field(None, description="EXT-X-KEY 请求时附加的参数")
     key_format: Optional[str] = Field(None, description="EXT-X-KEY 返回的格式")
+    segments: Optional[str] = Field(None, description="只下载指定位置的片段 (0 起始, 逗号分隔, 如 0,3,5); 空则全部")
     no_merge: bool = Field(False, description="不合并, 保留分片目录 + m3u8")
     no_disk: bool = Field(False, description="不落磁盘, 直接推给 upload hook")
 
@@ -614,6 +615,7 @@ class TaskManager:
                 no_disk=req.no_disk,
                 key_param=req.key_param,
                 key_format=req.key_format,
+                segments=req.segments,
                 quiet=True,
             )
             downloader = M3U8Downloader(

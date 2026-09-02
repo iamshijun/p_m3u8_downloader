@@ -576,6 +576,7 @@ class DownloadConfig:
     no_disk: bool = False
     key_param: Optional[str] = None
     key_format: Optional[str] = None
+    segments: Optional[str] = None  # 只下载指定位置的片段, 0 起始, 逗号分隔, 如 "0,3,5"; 空则全部
     quiet: bool = False
 
 
@@ -622,6 +623,9 @@ class M3U8Downloader:
         # master playlist: 自动选择最高清晰度变体后, 重新解析其 m3u8 走正常流程
         if playlist.is_master:
             playlist = self._resolve_master_playlist(playlist)
+
+        # 指定片段过滤: 只保留指定位置的片段 (0 起始, 逗号分隔), 其余过滤掉
+        self._apply_segment_filter(playlist)
 
         if not playlist.segments:
             raise M3U8DownloadError("[!] m3u8 文件中未找到任何视频片段")
@@ -857,6 +861,54 @@ class M3U8Downloader:
             pixels = (v.width or 0) * (v.height or 0)
             return (pixels, v.bandwidth)
         return max(variants, key=sort_key)
+
+    # -- segment filtering ----------------------------------------------------
+
+    @staticmethod
+    def _parse_segment_indices(spec: Optional[str]) -> Optional[set[int]]:
+        """解析片段位置列表: 0 起始, 逗号分隔, 如 "0,3,5".
+
+        空/None 返回 None (表示不限制); 非法项忽略并告警.
+        """
+        if not spec or not spec.strip():
+            return None
+        indices: set[int] = set()
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if not part.isdigit():
+                print(f"[!] 忽略无效的片段位置: {part!r}")
+                continue
+            indices.add(int(part))
+        return indices or None
+
+    def _apply_segment_filter(self, playlist: M3U8Playlist) -> None:
+        """按 config.segments 只保留指定位置的片段, 其余过滤掉 (原地修改 playlist).
+
+        位置从 0 开始. 过滤后片段被重新连续编号, 分片文件/合并均按新序号处理.
+        对加密片段, 若 KEY 未显式携带 IV, 先按原始序号预计算派生 IV,
+        避免重排后 `media_sequence + i` 推导失准.
+        """
+        indices = self._parse_segment_indices(self.config.segments)
+        if indices is None:
+            return
+        total = len(playlist.segments)
+
+        # 先按原始序号预计算派生 IV (仅对无显式 IV 的加密片段)
+        for idx, seg in enumerate(playlist.segments):
+            if idx in indices and seg.key is not None and seg.key.iv is None:
+                seg.key.iv = struct.pack(">Q", playlist.media_sequence + idx).rjust(16, b"\x00")
+
+        valid = sorted(i for i in indices if i < total)
+        for i in sorted(i for i in indices if i >= total):
+            print(f"[!] 片段位置 {i} 超出范围 (共 {total} 个片段), 已忽略")
+        if not valid:
+            raise M3U8DownloadError(f"[!] 指定的片段位置均超出范围 (共 {total} 个片段)")
+
+        selected = set(valid)
+        playlist.segments = [seg for idx, seg in enumerate(playlist.segments) if idx in selected]
+        print(f"[*] 仅下载指定片段 {valid} (共 {len(playlist)} 个)")
 
     # -- base_url ------------------------------------------------------------
 
@@ -1132,6 +1184,7 @@ def main() -> None:
     parser.add_argument("--retries", "-r", type=int, default=3, help="下载失败重试次数 (默认: 3)")
     parser.add_argument("--key-param", default=None, help="EXT-X-KEY 请求时附加的参数")
     parser.add_argument("--key-format", default=None, help="EXT-X-KEY 返回的格式")
+    parser.add_argument("--segments", default=None, help="只下载指定位置的片段 (0 起始, 逗号分隔, 如 0,3,5); 默认全部下载")
     parser.add_argument("--no-merge", action="store_true", help="不合并片段, 仅下载到目录并保留 m3u8 文件")
     parser.add_argument("--no-disk", action="store_true", help="不落磁盘, 下载后直接传给上传 hook 上传到云盘")
 
@@ -1194,6 +1247,7 @@ def main() -> None:
         no_disk=args.no_disk,
         key_param=args.key_param,
         key_format=args.key_format,
+        segments=args.segments,
     )
     downloader = M3U8Downloader(
         config=config,

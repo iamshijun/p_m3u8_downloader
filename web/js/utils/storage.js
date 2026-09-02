@@ -4,8 +4,8 @@ import { $ } from "./dom.js";
 // 需要持久化的表单字段 id
 export const FORM_FIELDS = [
   "m3u8_input", "output", "base_url", 
-  //下载相关配置 
-  "workers", "retries", "timeout", "proxy", "key_param", "headers",
+  //下载相关配置
+  "workers", "retries", "timeout", "proxy", "key_param", "segments", "headers",
   "no_merge", "keep_temp", "no_disk",
   //upload相关
   "upload", "upload_token", "upload_ondup", "upload_retries", "upload_delete",

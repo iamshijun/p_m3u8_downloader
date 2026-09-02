@@ -60,6 +60,7 @@ function collectRequest(overrides = {}) {
     keep_temp: $("keep_temp").checked,
     headers: headers,
     key_param: $("key_param").value.trim() || null,
+    segments: $("segments").value.trim() || null,
     no_merge: $("no_merge").checked,
     no_disk: $("no_disk").checked,
   };
