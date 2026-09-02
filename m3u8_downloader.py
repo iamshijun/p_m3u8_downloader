@@ -24,7 +24,7 @@ import tempfile
 import time
 from abc import ABC
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Optional, Union
 from urllib.parse import urljoin, urlparse
 
@@ -180,6 +180,7 @@ class M3U8Segment:
     uri: str
     duration: float = 0.0
     key: Optional[KeyInfo] = None           # 加密信息, None 表示明文
+    index: int = 0                          # 在原始播放列表中的序号 (0 起始); --segments 过滤后仍保留原序号
 
 
 @dataclass
@@ -227,9 +228,10 @@ class M3U8Playlist:
         lines.append(f'#EXT-X-TARGETDURATION:{self.target_duration}')
         lines.append("#EXT-X-MEDIA-SEQUENCE:0")
         lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
-        for index,segment in enumerate(self.segments):
+        for segment in self.segments:
             lines.append(f"#EXTINF:{segment.duration},")
-            lines.append(seg_format.format(index))
+            # 用原始序号命名, 与下载的分片文件名保持一致 (过滤场景下序号不连续)
+            lines.append(seg_format.format(segment.index))
            
         lines.append("#EXT-X-ENDLIST") 
         return os.linesep.join(lines)
@@ -402,18 +404,18 @@ class SegmentMergeHook(BaseHook):
 
     def on_all_downloaded(self, ctx: HookContext) -> None:
         if self.merge:
-            self._do_merge(ctx.tmp_dir, len(ctx.playlist))
+            self._do_merge(ctx.tmp_dir, ctx.playlist.segments)
         else:
             self._keep_segments(ctx.tmp_dir)
 
-    def _do_merge(self, tmp_dir: str, total: int) -> None:
-        """按顺序合并片段."""
+    def _do_merge(self, tmp_dir: str, segments: list[M3U8Segment]) -> None:
+        """按原始序号顺序合并片段 (--segments 过滤后序号不连续)."""
         print(f"[*] 合并片段到: {self.output}")
 
-        with ProgressBar(total=total, desc="合并进度", unit="seg", quiet=self.quiet) as pbar:
+        with ProgressBar(total=len(segments), desc="合并进度", unit="seg", quiet=self.quiet) as pbar:
             with open(self.output, "wb") as outfile:
-                for i in range(total):
-                    path = os.path.join(tmp_dir, SEGMENT_FILENAME_TPL.format(i))
+                for seg in segments:
+                    path = os.path.join(tmp_dir, SEGMENT_FILENAME_TPL.format(seg.index))
                     if os.path.exists(path):
                         with open(path, "rb") as infile:
                             shutil.copyfileobj(infile, outfile)
@@ -800,7 +802,13 @@ class M3U8Downloader:
                     playlist.variants.append(current_variant)
                     current_variant = None
                 else:
-                    seg = M3U8Segment(uri=line, duration=current_duration, key=current_key)
+                    # 每个 segment 持有独立的 KeyInfo 副本, 避免共享实例导致
+                    # 逐段派生 IV (media_sequence + index) 被最后一次赋值覆盖
+                    seg = M3U8Segment(
+                        uri=line, duration=current_duration,
+                        key=replace(current_key) if current_key is not None else None,
+                        index=len(playlist.segments),
+                    )
                     playlist.segments.append(seg)
 
         return playlist
@@ -886,19 +894,13 @@ class M3U8Downloader:
     def _apply_segment_filter(self, playlist: M3U8Playlist) -> None:
         """按 config.segments 只保留指定位置的片段, 其余过滤掉 (原地修改 playlist).
 
-        位置从 0 开始. 过滤后片段被重新连续编号, 分片文件/合并均按新序号处理.
-        对加密片段, 若 KEY 未显式携带 IV, 先按原始序号预计算派生 IV,
-        避免重排后 `media_sequence + i` 推导失准.
+        位置从 0 开始. 片段的原始序号 (M3U8Segment.index) 保持不变:
+        分片文件名/合并/进度上报/派生 IV 均按原始序号处理, 过滤后序号不连续.
         """
         indices = self._parse_segment_indices(self.config.segments)
         if indices is None:
             return
         total = len(playlist.segments)
-
-        # 先按原始序号预计算派生 IV (仅对无显式 IV 的加密片段)
-        for idx, seg in enumerate(playlist.segments):
-            if idx in indices and seg.key is not None and seg.key.iv is None:
-                seg.key.iv = struct.pack(">Q", playlist.media_sequence + idx).rjust(16, b"\x00")
 
         valid = sorted(i for i in indices if i < total)
         for i in sorted(i for i in indices if i >= total):
@@ -957,10 +959,14 @@ class M3U8Downloader:
     # -- encryption ----------------------------------------------------------
 
     def _load_keys(self, playlist: M3U8Playlist) -> None:
-        """下载加密密钥并计算每段的 IV."""
+        """下载加密密钥并计算每段的 IV.
+
+        IV 按片段在原始播放列表中的序号 (seg.index) 派生: `media_sequence + index`,
+        --segments 过滤后序号不变, 推导结果与整片下载一致.
+        """
         key_cache: dict[str, bytes] = {}
 
-        for i, seg in enumerate(playlist.segments):
+        for seg in playlist.segments:
             if seg.key is None:
                 continue
             if seg.key.key_uri not in key_cache:
@@ -970,7 +976,7 @@ class M3U8Downloader:
             seg.key.key_data = key_cache[seg.key.key_uri]
 
             if seg.key.iv is None:
-                seq = playlist.media_sequence + i
+                seq = playlist.media_sequence + seg.index
                 seg.key.iv = struct.pack(">Q", seq).rjust(16, b"\x00")
 
     # -- download ------------------------------------------------------------
@@ -995,21 +1001,21 @@ class M3U8Downloader:
         try:
             with ProgressBar(total=total, desc="下载进度", unit="seg", quiet=self.config.quiet) as pbar:
                 for i, url in enumerate(urls):
-                    #统一为6位的seg片段标识
-                    dest = os.path.join(self.config.tmp_dir, SEGMENT_FILENAME_TPL.format(i))
-                    seg_key = playlist.segments[i].key
+                    seg = playlist.segments[i]
+                    # 统一为6位的seg片段标识, 按原始序号命名 (--segments 过滤后不重排)
+                    dest = os.path.join(self.config.tmp_dir, SEGMENT_FILENAME_TPL.format(seg.index))
                     futures[executor.submit(
-                        self._download_segment_task, url, dest, i, playlist.segments[i], seg_key
+                        self._download_segment_task, url, dest, seg.index, seg, seg.key
                     )] = i
 
                 for future in as_completed(futures):
-                    idx, filepath, status = future.result()
+                    idx, filepath, status = future.result()  # idx 为原始序号
                     if status == "ok":
                         success += 1
-                        paths[idx] = filepath
+                        paths[futures[future]] = filepath
                     else:
                         fail += 1
-                        pbar.write(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
+                        pbar.write(f"  [!] 片段 {idx} ({playlist.segments[futures[future]].uri}): {status}")
 
                     if not pbar.update(1):
                         pbar.log_progress(success + fail, total, success, fail)
@@ -1075,16 +1081,16 @@ class M3U8Downloader:
                 for i, url in enumerate(urls):
                     seg = playlist.segments[i]
                     futures[executor.submit(
-                        self._download_and_feed, url, i, seg, seg.key
+                        self._download_and_feed, url, seg.index, seg, seg.key
                     )] = i
 
                 for future in as_completed(futures):
-                    idx, status = future.result()
+                    idx, status = future.result()  # idx 为原始序号
                     if status == "ok":
                         success += 1
                     else:
                         fail += 1
-                        pbar.write(f"  [!] 片段 {idx} ({playlist.segments[idx].uri}): {status}")
+                        pbar.write(f"  [!] 片段 {idx} ({playlist.segments[futures[future]].uri}): {status}")
 
                     if not pbar.update(1):
                         pbar.log_progress(success + fail, total, success, fail)
