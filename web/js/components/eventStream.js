@@ -23,7 +23,15 @@ export function setOnStatusChange(fn) {
 function isHandledEvent(ev) {
   if (!ev || typeof ev !== "object") return false;
   return ["connected", "start", "playlist", "segment",
-          "all_downloaded", "status", "heartbeat"].includes(ev.type);
+          "all_downloaded", "status", "heartbeat",
+          "preflight", "preflight_retry", "preflight_ok"].includes(ev.type);
+}
+
+// 预检事件里的配额信息 → 可读文本 (字段缺失时返回空串)
+function quotaText(ev) {
+  if (ev.total == null) return "";
+  const used = ev.used != null ? humanSize(ev.used) : "?";
+  return ` (网盘已用 ${used} / 总 ${humanSize(ev.total)})`;
 }
 
 function dispatch(t, ev) {
@@ -69,6 +77,19 @@ function dispatch(t, ev) {
       if (onStatusChange) onStatusChange(ev.status);
       break;
     case "heartbeat":
+      break;
+    case "preflight":
+      taskCard.log(t.id, `上传预检中... (${ev.backend || "yunpan"} → ${ev.upload || ""})`);
+      break;
+    case "preflight_retry":
+      taskCard.log(
+        t.id,
+        `预检失败: ${ev.message || ""} → ${ev.delay}s 后重试 (${ev.attempt}/${ev.total})`,
+        "l-warn",
+      );
+      break;
+    case "preflight_ok":
+      taskCard.log(t.id, "✔ 上传预检通过" + quotaText(ev), "l-ok");
       break;
   }
 }

@@ -25,7 +25,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -339,8 +339,79 @@ def upload_bytes(
 # errno 6 表示 access_token 无效 (身份认证失败), 比较明确.
 QUOTA_URL = "https://pan.baidu.com/api/quota"
 
+# 预检重试默认值: 只对网络/服务端临时故障重试, 退避 1s/2s/4s...
+PREFLIGHT_RETRIES = 3
+PREFLIGHT_BACKOFF_BASE = 1.0
+# 临时性状态码 (网关错误 / 限流) → 可重试; 其余 4xx 视为不可重试
+PREFLIGHT_RETRYABLE_STATUS = {408, 425, 429} | set(range(500, 600))
 
-def preflight_check(token: str, timeout: float = 10.0) -> dict:
+
+class PreflightError(RuntimeError):
+    """云盘预检失败基类 (默认不重试)."""
+
+    retryable = False
+
+
+class PreflightAuthError(PreflightError):
+    """access_token 无效 / 过期 / 无权限 —— 重试无意义, 应立即失败."""
+
+
+class PreflightTransientError(PreflightError):
+    """网络抖动 / 服务端临时故障 —— 值得重试."""
+
+    retryable = True
+
+
+def _preflight_once(token: str, timeout: float) -> dict:
+    """单次预检请求. 失败时抛出已分类的 PreflightError 子类."""
+    try:
+        resp = httpx.get(
+            QUOTA_URL,
+            params={
+                "checkexpire": 1,
+                "checkfree": 1,
+                "access_token": token,
+            },
+            timeout=httpx.Timeout(timeout, connect=timeout),
+        )
+    except httpx.RequestError as e:
+        # ConnectError / ReadTimeout / RemoteProtocolError / ProxyError ...
+        raise PreflightTransientError(f"网络错误: {e}") from e
+
+    if resp.status_code in (401, 403):
+        raise PreflightAuthError(f"HTTP {resp.status_code}: {resp.text[:200]}")
+    if resp.status_code != 200:
+        detail = f"HTTP {resp.status_code}: {resp.text[:200]}"
+        if resp.status_code in PREFLIGHT_RETRYABLE_STATUS:
+            raise PreflightTransientError(detail)
+        raise PreflightError(detail)
+
+    try:
+        result: dict = resp.json()
+    except ValueError as e:
+        # 代理 / 防火墙 / 验证页返回 HTML 时会到这里
+        raise PreflightTransientError(f"响应不是合法 JSON: {resp.text[:200]}") from e
+
+    errno = result.get("errno")
+    if errno in (0, None):
+        return {
+            "errno": 0,
+            "total": result.get("total"), #int: 总空间大小，单位B
+            "used": result.get("used"), #int: 已使用大小，单位B
+            "free": result.get("free"), # int: 免费容量，单位B
+            "expire": result.get("expire"),#bool: 7天内是否有容量到期
+        }
+    # errno=6 表示认证失败  (reference: https://pan.baidu.com/union/doc/%E5%B9%B3%E5%8F%B0%E7%AE%80%E4%BB%8B/%E9%94%99%E8%AF%AF%E7%A0%81/)
+    errmsg = result.get("errmsg", "unknown")
+    raise PreflightAuthError(f"云盘预检失败 (errno={errno} {errmsg})")
+
+
+def preflight_check(
+    token: str,
+    timeout: float = 10.0,
+    max_retries: int = PREFLIGHT_RETRIES,
+    on_retry: Optional[Callable[[int, int, float, Exception], None]] = None,
+) -> dict:
     """Pre-flight check: validate Baidu access_token via the quota API.
 
     Calls ``GET /api/quota`` (a lightweight, non-destructive user-info call)
@@ -353,8 +424,19 @@ def preflight_check(token: str, timeout: float = 10.0) -> dict:
     of segments that we can never upload. 后续的上传会自己创建目标目录, 本函数
     不再做任何路径相关的检查 / 写入.
 
-    No retry: a failed check should propagate immediately so the caller can
-    abort the download.
+    重试策略 (避免网络抖动被误判成 token 失效):
+      - 只重试 PreflightTransientError: httpx.RequestError (连接/读取超时等),
+        5xx / 429, 非法 JSON 响应; 退避 1s, 2s, 4s, ...
+      - PreflightAuthError (errno != 0 / 401 / 403) 立即抛出, 不做无谓重试,
+        调用方据此终止下载
+    预检使用独立的一次性请求, 不继承调用方的 proxy / header 配置.
+
+    Args:
+        token: 百度云盘 access_token.
+        timeout: 单次请求的超时秒数 (connect / read 相同).
+        max_retries: 临时故障的重试次数 (默认 3, 即最多请求 4 次).
+        on_retry: 可选回调 ``(attempt, total, delay, error)``, 在每次重试前调用,
+            供调用方上报进度 (CLI 打印 / API 事件流).
 
     Returns:
         A small dict with the API response on success. Raises on failure.
@@ -362,29 +444,23 @@ def preflight_check(token: str, timeout: float = 10.0) -> dict:
     if not token:
         raise ValueError("token 不能为空")
 
-    resp = httpx.get(
-        QUOTA_URL,
-        params={
-            "checkexpire": 1,
-            "checkfree": 1,
-            "access_token": token,
-        },
-        timeout=timeout,
-    )
-    resp.raise_for_status()
-    result: dict = resp.json()
-    errno = result.get("errno")
-    if errno in (0, None):
-        return {
-            "errno": 0,
-            "total": result.get("total"), #int: 总空间大小，单位B
-            "used": result.get("used"), #int: 已使用大小，单位B
-            "free": result.get("free"), # int: 免费容量，单位B
-            "expire": result.get("expire"),#bool: 7天内是否有容量到期
-        }
-    # errno=6 表示认证失败  (reference: https://pan.baidu.com/union/doc/%E5%B9%B3%E5%8F%B0%E7%AE%80%E4%BB%8B/%E9%94%99%E8%AF%AF%E7%A0%81/)
-    errmsg = result.get("errmsg", "unknown")
-    raise RuntimeError(f"云盘预检失败 (errno={errno} {errmsg})")
+    last_error: Optional[PreflightError] = None
+    for attempt in range(max_retries + 1):
+        if attempt > 0:
+            delay = PREFLIGHT_BACKOFF_BASE * (2 ** (attempt - 1))
+            if on_retry is not None:
+                try:
+                    on_retry(attempt, max_retries, delay, last_error)
+                except Exception:
+                    pass          # 上报失败不影响预检本身
+            time.sleep(delay)
+        try:
+            return _preflight_once(token, timeout)
+        except PreflightTransientError as e:
+            last_error = e
+
+    assert last_error is not None
+    raise last_error
 
 
 # ── Directory upload ───────────────────────────────────────────────────────

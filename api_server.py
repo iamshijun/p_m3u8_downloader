@@ -73,6 +73,7 @@ from m3u8_downloader import (
     UploadHook,
     YunpanUploadHook,
     create_upload_hook,
+    upload_preflight,
 )
 
 
@@ -427,14 +428,22 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^\w.\-]", "_", base)
 
 
-def _run_preflight(hook_type: str, token: str) -> None:
-    """上传预检: 根据后端类型执行对应的认证/连通性检查."""
-    if hook_type == "yunpan":
-        from pan_upload import preflight_check
-        preflight_check(token=token)
-    # 其他后端可在此扩展
-    # elif hook_type == "s3":
-    #     _s3_preflight(...)
+def _run_preflight(hook_type: str, token: str, task: Optional[Task] = None) -> dict:
+    """上传预检: 根据后端类型执行认证/连通性检查 (统一走 m3u8_downloader.upload_preflight).
+
+    传 task 时把重试过程通过事件流上报给前端 (preflight_retry).
+    """
+    on_retry = None
+    if task is not None:
+        def on_retry(attempt, total, delay, error):
+            task.emit({
+                "type": "preflight_retry",
+                "attempt": attempt,
+                "total": total,
+                "delay": delay,
+                "message": str(error),
+            })
+    return upload_preflight(hook_type, token, on_retry=on_retry)
 
 
 class TaskManager:
@@ -586,14 +595,20 @@ class TaskManager:
                     task.set_status(TaskStatus.ERROR, message=task.error)
                     return
                 # 下载前预检 (按后端类型分别校验)
-                task.emit({"type": "preflight", "upload": upload_cfg.path})
+                task.emit({"type": "preflight", "upload": upload_cfg.path, "backend": upload_cfg.type})
                 try:
-                    _run_preflight(upload_cfg.type, token)
+                    quota = _run_preflight(upload_cfg.type, token, task)
                 except Exception as e:
                     task.error = f"上传预检失败: {e}"
                     task.set_status(TaskStatus.ERROR, message=task.error, stage="preflight")
                     return
-                task.emit({"type": "preflight_ok", "upload": upload_cfg.path})
+                task.emit({
+                    "type": "preflight_ok",
+                    "upload": upload_cfg.path,
+                    "total": quota.get("total"),
+                    "used": quota.get("used"),
+                    "free": quota.get("free"),
+                })
                 hooks.append(create_upload_hook(
                     upload_cfg.type,
                     token=token,

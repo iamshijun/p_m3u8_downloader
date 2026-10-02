@@ -522,6 +522,36 @@ class YunpanUploadHook(UploadHook):
             print(f"[!] 上传失败: {remote_path} — {e}")
 
 
+def _print_preflight_retry(attempt: int, total: int, delay: float, error: Exception) -> None:
+    """CLI 默认的预检重试提示."""
+    print(f"[*] 上传预检失败 ({error}); {delay:.0f}s 后重试 ({attempt}/{total})")
+
+
+def upload_preflight(
+    hook_type: str = "yunpan",
+    token: str = "",
+    max_retries: int = 3,
+    on_retry=None,
+) -> dict:
+    """上传预检: 下载开始前校验上传后端凭证.
+
+    统一入口 —— CLI (main) 与 api_server 都调用这里, 保证两条路径行为一致.
+    预检使用独立的一次性 HTTP 请求, 不继承下载器的 proxy / header 配置.
+
+    - 网络 / 服务端临时故障: 指数退避重试 (1s/2s/4s...), 最多 max_retries 次
+    - token 无效 / 过期 (认证失败): 立即抛错, 不重试
+    - 成功时返回后端返回的配额信息 dict
+    """
+    if hook_type == "yunpan":
+        from pan_upload import preflight_check
+        return preflight_check(
+            token=token,
+            max_retries=max_retries,
+            on_retry=on_retry or _print_preflight_retry,
+        )
+    raise ValueError(f"Unknown upload hook type: {hook_type}")
+
+
 def create_upload_hook(hook_type: str, **kwargs) -> UploadHook:
     """工厂函数: 根据类型创建对应的 upload hook.
 
@@ -1229,6 +1259,17 @@ def main() -> None:
         if not token:
             print("[!] 启用 --upload 但未提供 ACCESS_TOKEN, 请用 --upload-token 指定或写入 .env")
             sys.exit(1)
+        # 下载前预检: token 失效 / 网络故障在此提前失败, 避免下载完才发现无法上传
+        try:
+            quota = upload_preflight("yunpan", token)
+        except Exception as e:
+            print(f"[!] 上传预检失败, 终止下载: {e}")
+            sys.exit(1)
+        total, used = quota.get("total"), quota.get("used")
+        if total is not None:
+            print(f"[*] 上传预检通过 (云盘已用 {used} / 总 {total} 字节)")
+        else:
+            print("[*] 上传预检通过")
         hooks.append(create_upload_hook(
             "yunpan",
             token=token,
