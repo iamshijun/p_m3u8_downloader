@@ -45,6 +45,26 @@ DEFAULT_WORKERS = 5
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
+# 时间戳格式, 与 m3u8_downloader.LOG_TIME_FORMAT 一致 (Java 的 yyyy-MM-dd HH:mm:ss)
+LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def log(msg: str = "", *, file=None) -> None:
+    """带时间戳的日志输出, 形如 ``[2026-02-05 14:33:01] 内容``.
+
+    作为库被 m3u8_downloader 调用时, 输出会和下载日志混在同一份 stdout,
+    加时间戳便于按时间排查 (实时 flush).
+    """
+    stream = file or sys.stdout
+    stream.write(f"[{time.strftime(LOG_TIME_FORMAT)}] {msg}\n")
+    stream.flush()
+
+
+def log_tqdm(msg: str) -> None:
+    """有 tqdm 进度条时用 tqdm.write 输出, 避免冲散进度条 (同样带时间戳)."""
+    tqdm.write(f"[{time.strftime(LOG_TIME_FORMAT)}] {msg}")
+
+
 def load_access_token(env_file: str | None = None) -> str:
     """Load ACCESS_TOKEN from a .env file.  Exit if not found."""
     env_path = Path(env_file or DEFAULT_ENV_FILE)
@@ -54,7 +74,7 @@ def load_access_token(env_file: str | None = None) -> str:
 
     token = os.getenv("ACCESS_TOKEN")
     if not token:
-        print(
+        log(
             f"ERROR: ACCESS_TOKEN not set. "
             f"Place it in {env_path} or use --token.",
             file=sys.stderr,
@@ -93,7 +113,7 @@ def _load_progress(local_dir: Path, remote_dir: str) -> set[str]:
     except (json.JSONDecodeError, OSError):
         return set()
     if data.get("remote_prefix") != remote_dir:
-        tqdm.write("[resume] Remote path changed — starting fresh.")
+        log_tqdm("[resume] Remote path changed — starting fresh.")
         pp.unlink(missing_ok=True)
         return set()
     return set(data.get("uploaded", []))
@@ -154,7 +174,7 @@ def _do_upload_raw(local_path: Path, remote_path: str, token: str, ondup: str) -
         )
     #response.raise_for_status()
     if response.status_code != 200:
-        print(f'response code {response.status_code} body: {response.text}')
+        log(f'response code {response.status_code} body: {response.text}')
         raise RuntimeError(f"HTTP error {response.status_code}: {response.text}")
     result: dict = response.json()
 
@@ -181,7 +201,7 @@ def _upload_with_retry(
     for attempt in range(max_retries + 1):
         if attempt > 0:
             delay = 2 ** (attempt - 1)
-            tqdm.write(
+            log_tqdm(
                 f"  [retry {attempt}/{max_retries}] {local_path.name} "
                 f"(wait {delay}s)"
             )
@@ -217,17 +237,17 @@ def upload_file(
     local = Path(local_path)
 
     if not local.exists():
-        print(f"ERROR: file not found: {local_path}", file=sys.stderr)
+        log(f"ERROR: file not found: {local_path}", file=sys.stderr)
         sys.exit(1)
     if not local.is_file():
-        print(f"ERROR: not a regular file: {local_path}", file=sys.stderr)
+        log(f"ERROR: not a regular file: {local_path}", file=sys.stderr)
         sys.exit(1)
 
     size = local.stat().st_size
 
     # Check file size limit
     if max_size is not None and size > max_size:
-        print(f"SKIPPED: {local}  ({_human_size(size)}) - exceeds size limit of {_human_size(max_size)}")
+        log(f"SKIPPED: {local}  ({_human_size(size)}) - exceeds size limit of {_human_size(max_size)}")
         return {
             'skipped': True,
             'path': str(local),
@@ -235,29 +255,27 @@ def upload_file(
             'reason': f'Exceeds size limit of {max_size} bytes'
         }
 
-    print(f"Uploading: {local}  ({_human_size(size)})")
-    print(f"Target:    {remote_path}")
+    log(f"Uploading: {local}  ({_human_size(size)})")
+    log(f"Target:    {remote_path}")
     if max_retries > 0:
-        print(f"Retries:   {max_retries}")
-    print()
+        log(f"Retries:   {max_retries}")
 
     result = _upload_with_retry(local, remote_path, token, ondup, max_retries)
 
-    print()
-    print("Upload successful!")
-    print(f"  fs_id: {result.get('fs_id', 'N/A')}")
-    print(f"  path:  {result.get('path', 'N/A')}")
-    print(f"  size:  {result.get('size', 'N/A')}")
+    log("Upload successful!")
+    log(f"  fs_id: {result.get('fs_id', 'N/A')}")
+    log(f"  path:  {result.get('path', 'N/A')}")
+    log(f"  size:  {result.get('size', 'N/A')}")
     if result.get("md5"):
-        print(f"  md5:   {result['md5']}")
+        log(f"  md5:   {result['md5']}")
 
     # Delete local file after successful upload if requested
     if delete_after_upload:
         try:
             local.unlink()
-            print(f"  Local file deleted: {local}")
+            log(f"  Local file deleted: {local}")
         except OSError as e:
-            print(f"  WARNING: Failed to delete local file {local}: {e}", file=sys.stderr)
+            log(f"  WARNING: Failed to delete local file {local}: {e}", file=sys.stderr)
 
     return result
 
@@ -279,7 +297,7 @@ def _do_upload_bytes(data: bytes, filename: str, remote_path: str, token: str, o
     )
     #response.raise_for_status()
     if response.status_code != 200:
-        print(f'response code {response.status_code} body: {response.text}')
+        log(f'response code {response.status_code} body: {response.text}')
         raise RuntimeError(f"HTTP error {response.status_code}: {response.text}")
     
     result: dict = response.json()
@@ -304,7 +322,7 @@ def _upload_bytes_with_retry(
     for attempt in range(max_retries + 1):
         if attempt > 0:
             delay = 2 ** (attempt - 1)
-            tqdm.write(
+            log_tqdm(
                 f"  [retry {attempt}/{max_retries}] {filename} "
                 f"(wait {delay}s)"
             )
@@ -484,10 +502,10 @@ def upload_directory(
     local = Path(local_dir).resolve()
 
     if not local.exists():
-        print(f"ERROR: directory not found: {local_dir}", file=sys.stderr)
+        log(f"ERROR: directory not found: {local_dir}", file=sys.stderr)
         sys.exit(1)
     if not local.is_dir():
-        print(f"ERROR: not a directory: {local_dir}", file=sys.stderr)
+        log(f"ERROR: not a directory: {local_dir}", file=sys.stderr)
         sys.exit(1)
 
     all_files = sorted(
@@ -496,7 +514,7 @@ def upload_directory(
     )
 
     if not all_files:
-        print(f"No files found in {local}")
+        log(f"No files found in {local}")
         return
 
     # Filter files by size limit
@@ -510,27 +528,27 @@ def upload_directory(
                 size_skipped_count += 1
 
         if size_filtered_files:
-            print(f"Size limit: {_human_size(max_size)} - skipping {size_skipped_count} file(s) that exceed limit:")
+            log(f"Size limit: {_human_size(max_size)} - skipping {size_skipped_count} file(s) that exceed limit:")
             for fpath in size_filtered_files:
-                print(f"  SKIPPED: {fpath.name} ({_human_size(fpath.stat().st_size)})")
+                log(f"  SKIPPED: {fpath.name} ({_human_size(fpath.stat().st_size)})")
             print()
 
         all_files = [f for f in all_files if f.stat().st_size <= max_size]
 
     if not all_files:
-        print("No files to upload after filtering.")
+        log("No files to upload after filtering.")
         return
 
     remote_dir = remote_dir.rstrip("/") + "/"
 
-    print(f"Local dir:  {local}")
-    print(f"Remote dir: {remote_dir}")
-    print(f"Files:      {len(all_files)}")
-    print(f"Workers:    {workers}")
+    log(f"Local dir:  {local}")
+    log(f"Remote dir: {remote_dir}")
+    log(f"Files:      {len(all_files)}")
+    log(f"Workers:    {workers}")
     if max_retries > 0:
-        print(f"Retries:    {max_retries}")
+        log(f"Retries:    {max_retries}")
     if max_size is not None:
-        print(f"Size limit: {_human_size(max_size)}")
+        log(f"Size limit: {_human_size(max_size)}")
     print()
 
     # ── Resume state ─────────────────────────────────────────────────
@@ -538,7 +556,7 @@ def upload_directory(
     if resume:
         uploaded = _load_progress(local, remote_dir)
         if uploaded:
-            tqdm.write(
+            log_tqdm(
                 f"[resume] {len(uploaded)} file(s) already uploaded — skipping.\n"
             )
 
@@ -547,10 +565,10 @@ def upload_directory(
     skipped = len(all_files) - len(pending)
 
     if not pending:
-        print("All files already uploaded — nothing to do.")
+        log("All files already uploaded — nothing to do.")
         if resume:
             _clear_progress(local)
-            print("[resume] Progress record cleared.")
+            log("[resume] Progress record cleared.")
         return
 
     success = 0
@@ -580,7 +598,7 @@ def upload_directory(
                 except Exception as exc:
                     failed += 1
                     failed_details.append((fpath.name, _error_detail(exc)))
-                    tqdm.write(f"  FAIL  {fpath.name}  {_error_detail(exc)}")
+                    log_tqdm(f"  FAIL  {fpath.name}  {_error_detail(exc)}")
 
                 pbar.update(1)
         else:
@@ -610,27 +628,28 @@ def upload_directory(
                     except Exception as exc:
                         failed += 1
                         failed_details.append((fpath.name, _error_detail(exc)))
-                        tqdm.write(f"  FAIL  {fpath.name}  {_error_detail(exc)}")
+                        log_tqdm(f"  FAIL  {fpath.name}  {_error_detail(exc)}")
 
                     pbar.update(1)
 
     # ── Summary ──────────────────────────────────────────────────────
     print()
     print("─" * 50)
-    print(
+    log(
         f"Done.  {success} uploaded, {skipped} skipped, {failed} failed."
     )
 
     if failed_details:
-        print("\nFailed files:")
+        print()
+        log("Failed files:")
         for name, reason in failed_details:
-            print(f"  {name}  —  {reason}")
+            log(f"  {name}  —  {reason}")
 
     if failed == 0 and resume:
         _clear_progress(local)
-        print("[resume] Progress record cleared.")
+        log("[resume] Progress record cleared.")
     elif failed > 0 and resume:
-        print(
+        log(
             f"[resume] Progress saved ({success} ok). "
             f"Re-run to retry the {failed} failed file(s)."
         )

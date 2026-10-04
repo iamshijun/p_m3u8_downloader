@@ -73,6 +73,7 @@ from m3u8_downloader import (
     UploadHook,
     YunpanUploadHook,
     create_upload_hook,
+    log,
     upload_preflight,
 )
 
@@ -126,7 +127,7 @@ def _env_int(name: str, default: int) -> int:
     try:
         return int(raw.strip())
     except ValueError:
-        print(f"[warn] {name}={raw!r} 不是整数, 回退 {default}")
+        log(f"[warn] {name}={raw!r} 不是整数, 回退 {default}")
         return default
 
 
@@ -825,8 +826,20 @@ if os.path.isdir(_WEB_DIR):
 if __name__ == "__main__":
     import uvicorn
 
+    def _log_config() -> dict:
+        """uvicorn 默认日志没有时间戳, 复制默认配置给 formatter 补上 asctime."""
+        from copy import deepcopy
+
+        from uvicorn.config import LOGGING_CONFIG
+
+        cfg = deepcopy(LOGGING_CONFIG)
+        for formatter in cfg["formatters"].values():
+            formatter["fmt"] = f"%(asctime)s {formatter['fmt']}"
+            formatter["datefmt"] = "%Y-%m-%d %H:%M:%S"
+        return cfg
+
     # 传 app 对象而非 "api_server:app" 字符串: 字符串形式会让 uvicorn 以
     # "api_server" 之名二次 import 本模块, 模块级的 manager = TaskManager(...)
     # 会执行两遍 —— 两个线程池 + 两个清理线程, __main__ 那份纯泄漏.
-    print(f"[run] http://{HOST}:{PORT}")
-    uvicorn.run(app, host=HOST, port=PORT)
+    log(f"[run] http://{HOST}:{PORT}")
+    uvicorn.run(app, host=HOST, port=PORT, log_config=_log_config())

@@ -198,4 +198,5 @@ All wrappers pass `"$@"` through to `m3u8_downloader.py`.
 - **Key caching**: `_load_keys()` caches key bytes by URI — same key URI only downloaded once.
 - **Base URL resolution**: prioritized: `--base_url` arg → auto-derived from m3u8 URL → error.
 - **Progress**: uses `tqdm` if importable, falls back to text progress every 100 segments.
+- **Logging**: all CLI output goes through `log()` (defined in `m3u8_downloader.py`, re-exported by `api_server.py`; `pan_upload.py` keeps its own copy to stay importable standalone) which prefixes `[yyyy-MM-dd HH:mm:ss]` and flushes — no bare `print()` for messages. `ProgressBar.write` / `pan_upload.log_tqdm` use `tqdm.write` with the same prefix so progress bars aren't torn. `api_server` also passes a timestamped `log_config` to `uvicorn.run` (uvicorn's defaults have no `asctime`). Format constant: `LOG_TIME_FORMAT`.
 - **Retry**: each segment retries with 1s/2s/3s backoff before reporting failure.

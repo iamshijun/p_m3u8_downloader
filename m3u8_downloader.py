@@ -52,12 +52,37 @@ class M3U8DownloadError(Exception):
 SEGMENT_FILENAME_TPL = "seg_{:06d}"
 
 # ---------------------------------------------------------------------------
+# 日志
+# ---------------------------------------------------------------------------
+
+# 时间戳格式, 与 Java 的 yyyy-MM-dd HH:mm:ss 一致
+LOG_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+
+def _log_line(msg: str) -> str:
+    """给日志文本加上时间戳前缀."""
+    return f"[{time.strftime(LOG_TIME_FORMAT)}] {msg}"
+
+
+def log(msg: str = "", *, file=None) -> None:
+    """带时间戳的日志输出, 形如 ``[2026-02-05 14:33:01] 内容``.
+
+    Args:
+        msg: 日志内容
+        file: 输出流, 默认 stdout (实时 flush, 便于 nohup/systemd 下按时间排查)
+    """
+    stream = file or sys.stdout
+    stream.write(_log_line(msg) + "\n")
+    stream.flush()
+
+
+# ---------------------------------------------------------------------------
 # Progress Manager
 # ---------------------------------------------------------------------------
 
 
 class ProgressBar:
-    """进度条管理器：统一封装 tqdm 和 print 的逻辑."""
+    """进度条管理器：统一封装 tqdm 和日志输出的逻辑."""
 
     def __init__(
         self,
@@ -110,9 +135,10 @@ class ProgressBar:
             msg: 消息内容
         """
         if self.use_pbar and self.pbar:
-            tqdm.write(msg)
+            # 与 tqdm 进度条共存: 用 tqdm.write 保证进度条不被冲散
+            tqdm.write(_log_line(msg))
         else:
-            print(msg)
+            log(msg)
 
     def close(self) -> None:
         """关闭进度条."""
@@ -257,10 +283,10 @@ class HTTPClient:
         if proxy:
             proxy_handler = urllib.request.ProxyHandler({"http": proxy, "https": proxy})
             self._opener = urllib.request.build_opener(proxy_handler)
-            print(f"[*] 使用代理: {proxy}")
+            log(f"[*] 使用代理: {proxy}")
 
         if self.headers:
-            print(f"[*] 自定义请求头: {self.headers}")
+            log(f"[*] 自定义请求头: {self.headers}")
 
     def get(self, url: str, max_bytes: Optional[int] = None) -> bytes:
         """GET 请求, 返回响应体字节.
@@ -308,7 +334,7 @@ class HTTPClient:
         result: dict[str, str] = {}
         for h in raw_headers:
             if ":" not in h:
-                print(f"[!] 忽略无效的 Header 格式 (缺少冒号): {h}")
+                log(f"[!] 忽略无效的 Header 格式 (缺少冒号): {h}")
                 continue
             key, _, value = h.partition(":")
             result[key.strip()] = value.strip()
@@ -410,7 +436,7 @@ class SegmentMergeHook(BaseHook):
 
     def _do_merge(self, tmp_dir: str, segments: list[M3U8Segment]) -> None:
         """按原始序号顺序合并片段 (--segments 过滤后序号不连续)."""
-        print(f"[*] 合并片段到: {self.output}")
+        log(f"[*] 合并片段到: {self.output}")
 
         with ProgressBar(total=len(segments), desc="合并进度", unit="seg", quiet=self.quiet) as pbar:
             with open(self.output, "wb") as outfile:
@@ -432,14 +458,14 @@ class SegmentMergeHook(BaseHook):
 
         # 如果指定了keep_temp，直接使用该目录，不再移动到 {output}_segments
         if self.keep_temp:
-            print(f"[*] 已使用指定临时目录: {tmp_dir}")
+            log(f"[*] 已使用指定临时目录: {tmp_dir}")
             return
         
         name, _ = os.path.splitext(self.output)
         output_dir = name + "_segments"
         if os.path.exists(output_dir):
             shutil.rmtree(output_dir, ignore_errors=True)
-        print(f'[*] 移动临时目录到: {output_dir}')
+        log(f'[*] 移动临时目录到: {output_dir}')
         shutil.move(tmp_dir, output_dir)
 
     def on_finish(self, ctx: HookContext) -> None:
@@ -476,12 +502,12 @@ class YunpanUploadHook(UploadHook):
             self.upload_file = upload_file
             self.upload_bytes = upload_bytes
         except ImportError:
-            print(f"[!] 无法导入 yunpan_hls")
+            log(f"[!] 无法导入 yunpan_hls")
             raise
 
     def on_playlist_parsed(self, ctx: HookContext):
         content = ctx.playlist.to_file_content()
-        print("[*] upload m3u8 to ", f"{self.remote_prefix}/playlist.m3u8")
+        log(f"[*] upload m3u8 to {self.remote_prefix}/playlist.m3u8")
         self._do_upload_bytes(content.encode("utf-8"), "playlist.m3u8", f"{self.remote_prefix}/playlist.m3u8")
 
     def on_segment(self, ctx: HookContext) -> None:
@@ -503,9 +529,9 @@ class YunpanUploadHook(UploadHook):
                 max_retries=self.max_retries,
                 delete_after_upload=self.delete_after_upload,
             )
-            print(f"[*] 上传成功: {remote_path} (fs_id={result.get('fs_id', '?')})")
+            log(f"[*] 上传成功: {remote_path} (fs_id={result.get('fs_id', '?')})")
         except Exception as e:
-            print(f"[!] 上传失败: {remote_path} — {e}")
+            log(f"[!] 上传失败: {remote_path} — {e}")
 
     def _do_upload_bytes(self, data: bytes, filename: str, remote_path: str) -> None:
         try:
@@ -517,14 +543,14 @@ class YunpanUploadHook(UploadHook):
                 ondup=self.ondup,
                 max_retries=self.max_retries,
             )
-            #print(f"[*] 上传成功: {remote_path} (fs_id={result.get('fs_id', '?')})")
+            #log(f"[*] 上传成功: {remote_path} (fs_id={result.get('fs_id', '?')})")
         except Exception as e:
-            print(f"[!] 上传失败: {remote_path} — {e}")
+            log(f"[!] 上传失败: {remote_path} — {e}")
 
 
 def _print_preflight_retry(attempt: int, total: int, delay: float, error: Exception) -> None:
     """CLI 默认的预检重试提示."""
-    print(f"[*] 上传预检失败 ({error}); {delay:.0f}s 后重试 ({attempt}/{total})")
+    log(f"[*] 上传预检失败 ({error}); {delay:.0f}s 后重试 ({attempt}/{total})")
 
 
 def upload_preflight(
@@ -661,7 +687,7 @@ class M3U8Downloader:
 
         if not playlist.segments:
             raise M3U8DownloadError("[!] m3u8 文件中未找到任何视频片段")
-        print(f"[*] 共发现 {len(playlist)} 个视频片段")
+        log(f"[*] 共发现 {len(playlist)} 个视频片段")
 
         self._resolve_base_url()
         self._load_keys(playlist)
@@ -669,7 +695,7 @@ class M3U8Downloader:
         if playlist.is_encrypted:
             if not HAS_CRYPTO:
                 raise M3U8DownloadError("[!] 检测到加密片段, 但未安装 pycryptodome. 请运行: pip install pycryptodome")
-            print("[*] 检测到 AES-128 加密, 密钥已加载")
+            log("[*] 检测到 AES-128 加密, 密钥已加载")
             
         ctx = HookContext(playlist=playlist)
         for hook in self.hooks:
@@ -679,7 +705,7 @@ class M3U8Downloader:
 
         if not self.config.tmp_dir: #如果没有指定创建一个
             self.config.tmp_dir = tempfile.mkdtemp(prefix="m3u8_dl_")
-        print(f"[*] 临时目录: {self.config.tmp_dir}")
+        log(f"[*] 临时目录: {self.config.tmp_dir}")
         # -- no_disk 模式: 下载后直接 on_segment_data, 不写磁盘 -------------------
         if self.config.no_disk:
             self._download_segments_no_disk(playlist)
@@ -726,16 +752,16 @@ class M3U8Downloader:
             # 如果指定了keep-temp ，直接使用该目录
             if self.config.keep_temp:
                 result = self.config.tmp_dir
-                print(f"[*] 完成! 切片目录: {result}")
+                log(f"[*] 完成! 切片目录: {result}")
             else:
                 name, _ = os.path.splitext(self.config.output)
                 result = name + "_segments"
-                print(f"[*] 完成! 切片目录: {result}")
+                log(f"[*] 完成! 切片目录: {result}")
         else:
             result = self.config.output
             if os.path.exists(self.config.output):
                 total_size_mb = os.path.getsize(self.config.output) / (1024 * 1024)
-                print(f"[*] 完成! 输出文件: {self.config.output} ({total_size_mb:.1f} MB)")
+                log(f"[*] 完成! 输出文件: {self.config.output} ({total_size_mb:.1f} MB)")
 
         ctx = HookContext(result_path=result)
         for hook in self.hooks:
@@ -751,7 +777,7 @@ class M3U8Downloader:
     def _fetch_playlist(self) -> M3U8Playlist:
         """获取 m3u8 内容 (支持 URL 或本地文件) 并解析."""
         if urlparse(self.config.m3u8_source).scheme in ("http", "https"):
-            print(f"[*] 下载 m3u8 文件: {self.config.m3u8_source}")
+            log(f"[*] 下载 m3u8 文件: {self.config.m3u8_source}")
             content = self.http.get_text(self.config.m3u8_source, max_bytes=MAX_PLAYLIST_BYTES)
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".m3u8", delete=False, encoding="utf-8"
@@ -760,7 +786,7 @@ class M3U8Downloader:
                 self._tmp_m3u8_path = tmp.name
             return self._parse_playlist(content)
         else:
-            print(f"[*] 解析 m3u8 文件: {self.config.m3u8_source}")
+            log(f"[*] 解析 m3u8 文件: {self.config.m3u8_source}")
             with open(self.config.m3u8_source, "r", encoding="utf-8") as f:
                 return self._parse_playlist(f.read())
 
@@ -768,16 +794,16 @@ class M3U8Downloader:
         """从 master playlist 选择最高清晰度变体, 拉取并解析其 m3u8."""
         best = self._select_best_variant(master.variants)
         if best.resolution:
-            print(f"[*] master playlist 含 {len(master.variants)} 个变体, "
+            log(f"[*] master playlist 含 {len(master.variants)} 个变体, "
                   f"选择: {best.resolution} (带宽: {best.bandwidth})")
         else:
-            print(f"[*] master playlist 含 {len(master.variants)} 个变体, "
+            log(f"[*] master playlist 含 {len(master.variants)} 个变体, "
                   f"选择带宽最高: {best.bandwidth}")
 
         # 先确保 base_url 已解析 (用于拼接变体 URI)
         self._resolve_base_url()
         variant_url = self._resolve_url(best.uri)
-        print(f"[*] 获取变体 m3u8: {variant_url}")
+        log(f"[*] 获取变体 m3u8: {variant_url}")
 
         content = self.http.get_text(variant_url, max_bytes=MAX_PLAYLIST_BYTES)
 
@@ -861,7 +887,7 @@ class M3U8Downloader:
                 iv=bytes.fromhex(iv_str[2:]) if iv_str else None,
                 key_format=key_format,
             )
-        print(f"[!] 不支持的加密方法: {method}, 按明文处理")
+        log(f"[!] 不支持的加密方法: {method}, 按明文处理")
         return None
 
     @staticmethod
@@ -916,7 +942,7 @@ class M3U8Downloader:
             if not part:
                 continue
             if not part.isdigit():
-                print(f"[!] 忽略无效的片段位置: {part!r}")
+                log(f"[!] 忽略无效的片段位置: {part!r}")
                 continue
             indices.add(int(part))
         return indices or None
@@ -934,13 +960,13 @@ class M3U8Downloader:
 
         valid = sorted(i for i in indices if i < total)
         for i in sorted(i for i in indices if i >= total):
-            print(f"[!] 片段位置 {i} 超出范围 (共 {total} 个片段), 已忽略")
+            log(f"[!] 片段位置 {i} 超出范围 (共 {total} 个片段), 已忽略")
         if not valid:
             raise M3U8DownloadError(f"[!] 指定的片段位置均超出范围 (共 {total} 个片段)")
 
         selected = set(valid)
         playlist.segments = [seg for idx, seg in enumerate(playlist.segments) if idx in selected]
-        print(f"[*] 仅下载指定片段 {valid} (共 {len(playlist)} 个)")
+        log(f"[*] 仅下载指定片段 {valid} (共 {len(playlist)} 个)")
 
     # -- base_url ------------------------------------------------------------
 
@@ -948,13 +974,13 @@ class M3U8Downloader:
         """确定 base_url, 用于拼接相对路径."""
         if self.config.base_url is not None:
             self.config.base_url = self.config.base_url.rstrip("/") + "/"
-            print(f"[*] 根 URL (--base_url): {self.config.base_url}")
+            log(f"[*] 根 URL (--base_url): {self.config.base_url}")
         elif self._tmp_m3u8_path is not None:
             self.config.base_url = os.path.dirname(self.config.m3u8_source) + "/"
-            print(f"[*] 根 URL (自动): {self.config.base_url}")
+            log(f"[*] 根 URL (自动): {self.config.base_url}")
         elif self.config.m3u8_source and urlparse(self.config.m3u8_source).scheme in ("http", "https"):
             self.config.base_url = os.path.dirname(self.config.m3u8_source) + "/"
-            print(f"[*] 根 URL (自动): {self.config.base_url}")
+            log(f"[*] 根 URL (自动): {self.config.base_url}")
 
     def _resolve_url(self, uri: str) -> str:
         """将相对 URI 拼接为完整 URL."""
@@ -1001,7 +1027,7 @@ class M3U8Downloader:
                 continue
             if seg.key.key_uri not in key_cache:
                 key_url = self._resolve_url_with_token(seg.key.key_uri)
-                print(f"[*] 下载密钥: {key_url}")
+                log(f"[*] 下载密钥: {key_url}")
                 key_cache[seg.key.key_uri] = self.http.get(key_url)
             seg.key.key_data = key_cache[seg.key.key_uri]
 
@@ -1019,7 +1045,7 @@ class M3U8Downloader:
         CPU/带宽持续被打满). 改为手动管理, finally 中取消未执行的分片并不等待.
         """
         urls = [self._resolve_url(seg.uri) for seg in playlist.segments]
-        print(f"[*] 开始下载 (并发数: {self.config.workers})...")
+        log(f"[*] 开始下载 (并发数: {self.config.workers})...")
 
         paths: list[Optional[str]] = [None] * len(playlist)
         success = 0
@@ -1058,7 +1084,7 @@ class M3U8Downloader:
             executor.shutdown(wait=False)
 
         if fail > 0:
-            print(f"[!] {fail} 个片段下载失败, 合并结果可能不完整")
+            log(f"[!] {fail} 个片段下载失败, 合并结果可能不完整")
 
         return [p for p in paths if p is not None]
 
@@ -1099,7 +1125,7 @@ class M3U8Downloader:
         整份列表仍会全部下载+解密+上传, CPU/带宽持续被打满).
         """
         urls = [self._resolve_url(seg.uri) for seg in playlist.segments]
-        print(f"[*] 开始不落地下载 (并发数: {self.config.workers})...")
+        log(f"[*] 开始不落地下载 (并发数: {self.config.workers})...")
         total = len(playlist)
         success = 0
         fail = 0
@@ -1131,7 +1157,7 @@ class M3U8Downloader:
             executor.shutdown(wait=False)
 
         if fail > 0:
-            print(f"[!] {fail} 个片段失败")
+            log(f"[!] {fail} 个片段失败")
 
     def _download_and_feed(
         self,
@@ -1178,9 +1204,9 @@ class M3U8Downloader:
         """清理临时文件."""
         if self.config.keep_temp:
             if self.config.tmp_dir:
-                print(f"[*] 临时文件保留在: {self.config.tmp_dir}")
+                log(f"[*] 临时文件保留在: {self.config.tmp_dir}")
         else:
-            print("[*] 清理临时文件...")
+            log("[*] 清理临时文件...")
             if self.config.tmp_dir:
                 shutil.rmtree(self.config.tmp_dir, ignore_errors=True)
                 
@@ -1241,10 +1267,10 @@ def main() -> None:
     # --no-disk 校验
     if args.no_disk:
         if not args.upload:
-            print("[!] --no-disk 需要配合 --upload 使用")
+            log("[!] --no-disk 需要配合 --upload 使用")
             sys.exit(1)
         if not args.no_merge:
-            print("[*] --no-disk 自动开启 --no-merge 模式 (数据不入磁盘无法合并)")
+            log("[*] --no-disk 自动开启 --no-merge 模式 (数据不入磁盘无法合并)")
             args.no_merge = True
 
     # 构建 hooks
@@ -1257,19 +1283,19 @@ def main() -> None:
     if args.upload:
         token = _load_token(args.upload_token)
         if not token:
-            print("[!] 启用 --upload 但未提供 ACCESS_TOKEN, 请用 --upload-token 指定或写入 .env")
+            log("[!] 启用 --upload 但未提供 ACCESS_TOKEN, 请用 --upload-token 指定或写入 .env")
             sys.exit(1)
         # 下载前预检: token 失效 / 网络故障在此提前失败, 避免下载完才发现无法上传
         try:
             quota = upload_preflight("yunpan", token)
         except Exception as e:
-            print(f"[!] 上传预检失败, 终止下载: {e}")
+            log(f"[!] 上传预检失败, 终止下载: {e}")
             sys.exit(1)
         total, used = quota.get("total"), quota.get("used")
         if total is not None:
-            print(f"[*] 上传预检通过 (云盘已用 {used} / 总 {total} 字节)")
+            log(f"[*] 上传预检通过 (云盘已用 {used} / 总 {total} 字节)")
         else:
-            print("[*] 上传预检通过")
+            log("[*] 上传预检通过")
         hooks.append(create_upload_hook(
             "yunpan",
             token=token,
