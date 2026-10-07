@@ -5,11 +5,26 @@ async function jsonOrThrow(resp) {
   if (!resp.ok) {
     let detail = "";
     try { 
-      detail = (await resp.json()).detail || ""; 
+      detail = detailText((await resp.json()).detail);
     } catch { /* ignore */ }
     throw new Error(detail || `HTTP ${resp.status}`);
   }
   return resp.json();
+}
+
+// 后端 detail 可能是字符串 (HTTPException) 或数组 (pydantic 422 校验错误),
+// 统一转成可读文本, 避免 new Error([{...}]) 显示成 [object Object]
+function detailText(detail) {
+  if (!detail) return "";
+  if (typeof detail === "string") return detail;
+  if (Array.isArray(detail)) {
+    return detail.map(d => {
+      if (typeof d === "string") return d;
+      const loc = Array.isArray(d.loc) ? d.loc.filter(x => x !== "body").join(".") : "";
+      return [loc, d.msg].filter(Boolean).join(": ");
+    }).join("; ");
+  }
+  return JSON.stringify(detail);
 }
 
 // 创建下载任务

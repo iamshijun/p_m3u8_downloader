@@ -125,7 +125,7 @@
   <div class="modal-mask" id="importModal" style="display:none">
     <div class="modal">
       <h3>批量导入任务</h3>
-      <p class="hint">每行一个任务，格式：<code>文件名 URL</code>（空格分隔）。其余参数沿用当前表单设置。</p>
+      <p class="hint">每行一个任务，格式：<code>文件名 URL</code>（空格分隔）。URL 须为 http/https 链接（本地路径亦可）。其余参数沿用当前表单设置。任一行校验未通过时不会提交，请先修正。</p>
       <div class="modal-toolbar">
         <button type="button" class="secondary small" id="btnImportFile">选择 .txt 文件</button>
         <input type="file" id="importFile" accept=".txt,text/plain" style="display:none" />

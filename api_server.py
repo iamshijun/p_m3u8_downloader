@@ -55,6 +55,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
+from urllib.parse import urlparse
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
@@ -129,6 +130,40 @@ def _env_int(name: str, default: int) -> int:
     except ValueError:
         log(f"[warn] {name}={raw!r} 不是整数, 回退 {default}")
         return default
+
+
+# 带 scheme 的来源, 如 http:// https:// hhttps:// file:// 等
+_URL_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*)://")
+
+
+def validate_m3u8_source(raw: str) -> Optional[str]:
+    """校验 m3u8 来源 (URL 或本地路径): 合法返回 None, 否则返回可读的中文原因.
+
+    规则与 m3u8_downloader._fetch_playlist 保持一致 (那里按 scheme 是否为
+    http/https 决定走 HTTP 还是当本地文件 open()):
+    - 带 scheme 的: 只接受 http/https, 且必须有主机名; 如 hhttps:// / ftp:// 一律拒绝
+    - 不带 scheme 的: 视为本地文件路径, 语法放行 (存在性交由下载阶段判断)
+
+    用例表 (共同契约, 改规则时与 web/js/utils/validate.js 一起改):
+    tests/test_m3u8_source_validation.py
+    """
+    src = (raw or "").strip()
+    if not src:
+        return "缺少 URL"
+    m = _URL_SCHEME_RE.match(src)
+    if not m:
+        # 形如 https:/host / https:host 的残缺写法 (真实本地路径几乎不可能这么开头)
+        if re.match(r"^https?:\S", src, re.IGNORECASE):
+            return "URL 格式错误: 缺少 // (应为 http:// 或 https://)"
+        return None  # 本地路径
+    scheme = m.group(1)
+    if scheme.lower() not in ("http", "https"):
+        return f"URL 协议不支持: {scheme}:// (仅支持 http/https)"
+    if re.search(r"\s", src):
+        return "URL 不能包含空白字符"
+    if not urlparse(src).netloc:
+        return "URL 缺少主机名"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -682,6 +717,9 @@ def health() -> dict:
 @app.post("/api/download")
 def download(req: DownloadRequest) -> dict:
     """创建下载任务, 立即返回 task_id (不阻塞)."""
+    reason = validate_m3u8_source(req.m3u8_input)
+    if reason:
+        raise HTTPException(status_code=400, detail=reason)
     task = manager.create(req)
     return {"task_id": task.id, "status": task.status}
 
@@ -691,8 +729,11 @@ def download_batch(req: BatchDownloadRequest) -> dict:
     """批量创建下载任务: 逐个校验 + 去重后创建.
 
     去重规则: URL 或 规范化后的文件名 与本次批量内或当前注册表中仍在的任务重复 → 跳过.
-    非法项(缺 URL/文件名、参数校验失败、超出 BATCH_LIMIT)计入 errors, 合法项照常创建.
-    返回 {"created": [...], "skipped": [...], "errors": [...]}.
+    非法项(缺 URL/文件名、URL 校验不通过、参数校验失败、超出 BATCH_LIMIT)计入 errors,
+    合法项照常创建. 返回 {"created": [...], "skipped": [...], "errors": [...]}.
+
+    注意: 前端在提交前会先做同样的 URL 校验, 有任何 errors 就不发本请求;
+    此处校验是兜底 (直接调 API 的客户端, 如脚本/curl).
     """
     created: list[dict] = []
     skipped: list[dict] = []
@@ -720,6 +761,10 @@ def download_batch(req: BatchDownloadRequest) -> dict:
 
         if not url:
             errors.append({"line": line_no, "reason": "缺少 URL"})
+            continue
+        url_error = validate_m3u8_source(url)
+        if url_error:
+            errors.append({"line": line_no, "reason": url_error, "input": url})
             continue
         if not upload_path:
             errors.append({"line": line_no, "reason": "缺少文件名", "input": url})

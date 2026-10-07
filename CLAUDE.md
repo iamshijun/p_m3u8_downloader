@@ -14,7 +14,19 @@ python3 -c "import py_compile; py_compile.compile('m3u8_downloader.py', doraise=
 
 # Run
 python3 m3u8_downloader.py <m3u8_file_or_url> [options]
+
+# Tests (from repo root; needs requirements.txt deps, stdlib `unittest` only)
+.venv/bin/python -m unittest
+.venv/bin/python -m unittest -v tests.test_m3u8_source_validation
 ```
+
+### Tests (`tests/`)
+
+`tests/test_m3u8_source_validation.py` guards the m3u8-source validation contract:
+- `ValidateM3u8SourceTest` — table-driven cases for `api_server.validate_m3u8_source()`
+- `DownloadEndpointValidationTest` — `TestClient` contract for both entries (`/api/download` → 400, `/api/download/batch` → per-line `errors`), with `manager` replaced by a fake so no test touches the network or writes to `downloads/`
+
+The `CASES` table in that file is the **shared contract** for three places that must change together: `api_server.validate_m3u8_source()`, `web/js/utils/validate.js` `validateM3u8Source()`, and the table itself.
 
 ## Architecture
 
@@ -68,11 +80,14 @@ python3 api_server.py              # direct run — all three read the project-r
 Endpoints:
 
 ```
-POST   /api/download            — create a task, returns {task_id} (non-blocking)
+POST   /api/download            — create a task, returns {task_id} (non-blocking);
+                                 400 with a Chinese `detail` when `m3u8_input` fails
+                                 `validate_m3u8_source()`
 POST   /api/download/batch      — batch create tasks, returns {created, skipped, errors}:
                                  dedupes by URL / sanitized output filename against the
                                  current registry + the batch itself; malformed entries
-                                 land in errors (per-line, with optional `line` echoed back)
+                                 land in errors (per-line, with optional `line` echoed back),
+                                 including `m3u8_input` scheme validation
 GET    /api/tasks               — list all task snapshots
 GET    /api/tasks/{id}          — single task detail
 GET    /api/tasks/{id}/stream   — NDJSON stream (application/x-ndjson, HTTP Chunked):
@@ -185,6 +200,7 @@ Single-file frontend served by `api_server.py`. Multi-task download manager:
 - Each card subscribes to `/api/tasks/{id}/stream` via `fetch` + `ReadableStream` reader, parsing NDJSON line-by-line.
 - On load, `GET /api/tasks` restores existing tasks and reconnects streams for non-terminal ones.
 - **Form memory**: on successful submit, `saveForm()` persists the form to `localStorage["m3u8_last_form"]`; `restoreForm()` refills it on next load (includes `upload_token`).
+- **Source validation (`web/js/utils/validate.js`)**: `validateM3u8Source()` mirrors `api_server.validate_m3u8_source()` — a source with a scheme must be `http`/`https` with a non-empty host (so `hhttps://` is rejected), while a scheme-less string is treated as a local path and passes; `http:/x` (missing `//`) is also flagged. The single-task form validates on submit, and batch import validates every line in `updateImportPreview()`, which disables "导入" and shows the offending line's raw text; `importTasks()` hard-returns before `createBatchTasks()` whenever any line fails, so a bad batch never hits the API. Dedupe `skipped` entries are **not** treated as errors and never block a batch.
 
 ## Legacy Wrapper scripts
 

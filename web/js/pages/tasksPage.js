@@ -1,6 +1,7 @@
 // 业务编排: 表单收集 + 任务操作 (添加/取消/删除/刷新/清除)
-import { $ } from "../utils/dom.js";
+import { $, escapeHtml } from "../utils/dom.js";
 import { saveForm } from "../utils/storage.js";
+import { validateM3u8Source } from "../utils/validate.js";
 import { createTask, createBatchTasks, listTasks, cancelTask, removeTask } from "../api/client.js";
 import { taskCard } from "../components/taskCard.js";
 import { subscribe, unsubscribe, isSubscribed, setOnStreamClosed, setOnStatusChange } from "../components/eventStream.js";
@@ -81,6 +82,12 @@ function collectRequest(overrides = {}) {
 async function addTask() {
   const req = collectRequest();
   if (!req.m3u8_input) { alert("请输入 M3U8 URL 或路径"); return; }
+  const urlError = validateM3u8Source(req.m3u8_input);
+  if (urlError) {
+    alert("M3U8 地址无效: " + urlError);
+    $("m3u8_input").focus();
+    return;
+  }
 
   $("btnAdd").disabled = true;
   try {
@@ -163,7 +170,8 @@ async function clearDone() {
 
 // ---- 批量导入 ----
 
-// 解析导入文本: 每行 "文件名 URL" (空白分隔), 格式不合法计入 errors
+// 解析导入文本: 每行 "文件名 URL" (空白分隔), 格式/URL 不合法计入 errors
+// 有任何 errors 时 importTasks 不会提交请求 (必须先由用户修正)
 function parseImportText(text) {
   const candidates = [];
   const errors = [];
@@ -178,27 +186,37 @@ function parseImportText(text) {
       return;
     }
     const [upload, url] = parts;
+    const urlError = validateM3u8Source(url);
+    if (urlError) {
+      errors.push({ line, field: "url", reason: urlError, text: trimmed });
+      return;
+    }
     candidates.push({ line, upload, m3u8_input: url });
   });
   return { candidates, errors };
 }
 
-// 更新弹窗中的有效/错误统计 + 错误明细
+// 更新弹窗中的有效/错误统计 + 错误明细, 并按校验结果开关"导入"按钮
 function updateImportPreview() {
   const { candidates, errors } = parseImportText($("importText").value);
   const bits = [];
   if (candidates.length) bits.push(candidates.length + " 条有效");
-  if (errors.length) bits.push(errors.length + " 条格式错误");
+  if (errors.length) bits.push(errors.length + " 条校验未通过");
   $("importPreview").textContent = bits.length ? bits.join("，") : "";
   const errBox = $("importErrors");
   if (errors.length) {
     errBox.innerHTML = errors.slice(0, 30)
-      .map(e => `<div>第 ${e.line} 行: ${e.reason}</div>`).join("");
+      .map(e => `<div>第 ${e.line} 行: ${escapeHtml(e.reason)}`
+        + (e.text ? ` — <code>${escapeHtml(e.text)}</code>` : "") + `</div>`).join("")
+      + (errors.length > 30 ? `<div>... 另有 ${errors.length - 30} 条</div>` : "");
     errBox.style.display = "";
   } else {
     errBox.innerHTML = "";
     errBox.style.display = "none";
   }
+  // 有校验错误时禁用导入按钮, 修好后自动恢复
+  $("btnImportOk").disabled = errors.length > 0;
+  $("btnImportOk").title = errors.length ? "请先修正校验未通过的行" : "";
   return { candidates, errors };
 }
 
@@ -225,7 +243,13 @@ function closeImportModal() {
 }
 
 async function importTasks() {
-  const { candidates } = updateImportPreview();
+  const { candidates, errors } = updateImportPreview();
+  // 硬闸: 只要有校验错误就不请求接口, 先让用户修正
+  if (errors.length) {
+    alert(`有 ${errors.length} 行校验未通过，请先修正后再导入`);
+    $("importText").focus();
+    return;
+  }
   if (!candidates.length) { alert("没有可导入的有效任务"); return; }
 
   // 合并当前表单配置 + 每行解析出的 文件名/URL
