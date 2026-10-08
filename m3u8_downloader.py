@@ -9,6 +9,8 @@ M3U8 视频下载 & 合并工具 (支持 AES-128 解密 + Hook 插件机制)
     python m3u8_downloader.py video.m3u8 --base_url https://example.com/video/ -o merged.ts
     # m3u8 URL, 仅下载不合并
     python m3u8_downloader.py https://example.com/playlist.m3u8 --no-merge -o my_video
+    # master playlist (多清晰度): 不下载高于 480p 的变体 (也接受 854x480 这种宽高双限写法)
+    python m3u8_downloader.py https://example.com/master.m3u8 --resolution 480p -o my_video.ts
     # 下载并上传到百度云盘
     python m3u8_downloader.py video.m3u8 --base_url https://example.com/video/ -no-disk \
         --upload /apps/{app_name}/movies/my_video/ --upload-token YOUR_TOKEN
@@ -619,6 +621,48 @@ DEFAULT_USER_AGENT = (
 # 直接拒绝, 避免把超大文件整体读入内存 (取消也无法中断读取).
 MAX_PLAYLIST_BYTES = 20 * 1024 * 1024
 
+# 清晰度上限: "854x480" (宽高双限) 或 "480p" (只限高度)
+_RESOLUTION_DIM_RE = re.compile(r"^(\d+)x(\d+)$")
+_RESOLUTION_HEIGHT_RE = re.compile(r"^(\d+)p$")
+
+
+def parse_resolution_limit(spec: Optional[str]) -> Optional[tuple[Optional[int], int]]:
+    """解析清晰度上限, 返回 (最大宽度, 最大高度); 未指定返回 None.
+
+    "480p" / "720P"  → (None, 480)   只限高度
+    "854x480"        → (854, 480)    宽高双限
+    空 / None        → None          不限制 (选最高清晰度)
+    其余格式         → 抛 ValueError, 消息为可读中文
+
+    这是校验 + 解析的唯一实现, CLI / api_server / 下载器共用同一套语义;
+    契约用例表见 tests/test_resolution_limit.py,
+    前端镜像 web/js/utils/validate.js 的 validateResolutionLimit().
+    """
+    raw = (spec or "").strip()
+    if not raw:
+        return None
+
+    text = raw.lower()
+    m = _RESOLUTION_DIM_RE.match(text)
+    if m:
+        width, height = int(m.group(1)), int(m.group(2))
+        if width > 0 and height > 0:
+            return (width, height)
+    else:
+        m = _RESOLUTION_HEIGHT_RE.match(text)
+        if m:
+            height = int(m.group(1))
+            if height > 0:
+                return (None, height)
+
+    raise ValueError(f"清晰度上限格式无效: {raw} (应为 480p 或 854x480)")
+
+
+def format_resolution_limit(limit: tuple[Optional[int], int]) -> str:
+    """把解析后的上限还原成人类可读文本 (日志/报错用)."""
+    max_width, max_height = limit
+    return f"{max_width}x{max_height}" if max_width is not None else f"{max_height}p"
+
 
 @dataclass
 class DownloadConfig:
@@ -635,6 +679,7 @@ class DownloadConfig:
     key_param: Optional[str] = None
     key_format: Optional[str] = None
     segments: Optional[str] = None  # 只下载指定位置的片段, 0 起始, 逗号分隔, 如 "0,3,5"; 空则全部
+    resolution: Optional[str] = None  # 清晰度上限, 如 "480p" / "854x480"; 空则选最高清晰度变体
     quiet: bool = False
 
 
@@ -668,6 +713,10 @@ class M3U8Downloader:
             )]
         self.hooks = hooks
 
+        # 清晰度上限 ("480p" → (None, 480) / "854x480" → (854, 480)); 未指定为 None
+        # 在此解析: 格式非法时立刻失败, 不必等到下载 m3u8 之后
+        self._resolution_limit = parse_resolution_limit(config.resolution)
+
         # 内部状态
         # 下载的m3u8文件存放的临时路径 (ps:完成后暂时不会被删除)
         self._tmp_m3u8_path: Optional[str] = None
@@ -679,8 +728,12 @@ class M3U8Downloader:
         playlist = self._fetch_playlist()
 
         # master playlist: 自动选择最高清晰度变体后, 重新解析其 m3u8 走正常流程
+        # (指定了 --resolution 时不选择高于该上限的变体)
         if playlist.is_master:
             playlist = self._resolve_master_playlist(playlist)
+        elif self._resolution_limit is not None:
+            log(f"[*] 非 master playlist (单一清晰度), 清晰度上限 "
+                f"{format_resolution_limit(self._resolution_limit)} 无法应用, 已忽略")
 
         # 指定片段过滤: 只保留指定位置的片段 (0 起始, 逗号分隔), 其余过滤掉
         self._apply_segment_filter(playlist)
@@ -791,14 +844,20 @@ class M3U8Downloader:
                 return self._parse_playlist(f.read())
 
     def _resolve_master_playlist(self, master: M3U8Playlist) -> M3U8Playlist:
-        """从 master playlist 选择最高清晰度变体, 拉取并解析其 m3u8."""
-        best = self._select_best_variant(master.variants)
+        """从 master playlist 选择变体 (受清晰度上限约束), 拉取并解析其 m3u8."""
+        if self._resolution_limit is None:
+            best = self._select_best_variant(master.variants)
+            cap = ""
+        else:
+            best = self._select_variant_by_limit(master.variants, self._resolution_limit)
+            cap = f" [上限 {format_resolution_limit(self._resolution_limit)}]"
+
         if best.resolution:
             log(f"[*] master playlist 含 {len(master.variants)} 个变体, "
-                  f"选择: {best.resolution} (带宽: {best.bandwidth})")
+                  f"选择: {best.resolution} (带宽: {best.bandwidth}){cap}")
         else:
             log(f"[*] master playlist 含 {len(master.variants)} 个变体, "
-                  f"选择带宽最高: {best.bandwidth}")
+                  f"选择带宽最高: {best.bandwidth}{cap}")
 
         # 先确保 base_url 已解析 (用于拼接变体 URI)
         self._resolve_base_url()
@@ -921,10 +980,45 @@ class M3U8Downloader:
     @staticmethod
     def _select_best_variant(variants: list[M3U8Variant]) -> M3U8Variant:
         """选择最佳变体: 优先按分辨率像素数, 其次按带宽."""
-        def sort_key(v: M3U8Variant) -> tuple[int, int]:
-            pixels = (v.width or 0) * (v.height or 0)
-            return (pixels, v.bandwidth)
-        return max(variants, key=sort_key)
+        return max(variants, key=M3U8Downloader._variant_sort_key)
+
+    @staticmethod
+    def _variant_sort_key(v: M3U8Variant) -> tuple[int, int]:
+        pixels = (v.width or 0) * (v.height or 0)
+        return (pixels, v.bandwidth)
+
+    def _select_variant_by_limit(
+        self, variants: list[M3U8Variant], limit: tuple[Optional[int], int]
+    ) -> M3U8Variant:
+        """在清晰度上限内选择最高变体.
+
+        - 候选: 带 RESOLUTION 且 高度 <= 上限高度, 宽度 <= 上限宽度 (仅 "480p" 时宽度不限)
+        - 候选非空 → 取其中像素数/带宽最大者
+        - 全部超限 → 报错终止, 不偷偷降级 ("不能下载大于它的")
+        - 变体全都没有 RESOLUTION → 无从判断, 告警后退回按带宽选
+        """
+        max_width, max_height = limit
+        label = format_resolution_limit(limit)
+
+        candidates = [
+            v for v in variants
+            if v.height is not None and v.height <= max_height
+            and (max_width is None or (v.width is not None and v.width <= max_width))
+        ]
+        if candidates:
+            return self._select_best_variant(candidates)
+
+        if any(v.height is not None for v in variants):
+            available = ", ".join(
+                (v.resolution or f"带宽{v.bandwidth}")
+                for v in sorted(variants, key=self._variant_sort_key)
+            )
+            raise M3U8DownloadError(
+                f"[!] 无满足清晰度上限 {label} 的变体, 可用: {available}"
+            )
+
+        log(f"[!] 变体未提供 RESOLUTION, 无法应用清晰度上限 {label}, 退回按带宽选择")
+        return self._select_best_variant(variants)
 
     # -- segment filtering ----------------------------------------------------
 
@@ -1247,6 +1341,8 @@ def main() -> None:
     parser.add_argument("--key-param", default=None, help="EXT-X-KEY 请求时附加的参数")
     parser.add_argument("--key-format", default=None, help="EXT-X-KEY 返回的格式")
     parser.add_argument("--segments", default=None, help="只下载指定位置的片段 (0 起始, 逗号分隔, 如 0,3,5); 默认全部下载")
+    parser.add_argument("--resolution", default=None,
+                        help="清晰度上限, 如 480p 或 854x480; master playlist 中不选择高于该值的变体 (默认: 最高清晰度)")
     parser.add_argument("--no-merge", action="store_true", help="不合并片段, 仅下载到目录并保留 m3u8 文件")
     parser.add_argument("--no-disk", action="store_true", help="不落磁盘, 下载后直接传给上传 hook 上传到云盘")
 
@@ -1263,6 +1359,13 @@ def main() -> None:
                         help="上传后保留本地分片")
 
     args = parser.parse_args()
+
+    # --resolution 校验: 格式非法直接退出, 不等下载阶段
+    try:
+        parse_resolution_limit(args.resolution)
+    except ValueError as e:
+        log(f"[!] {e}")
+        sys.exit(1)
 
     # --no-disk 校验
     if args.no_disk:
@@ -1321,6 +1424,7 @@ def main() -> None:
         key_param=args.key_param,
         key_format=args.key_format,
         segments=args.segments,
+        resolution=args.resolution,
     )
     downloader = M3U8Downloader(
         config=config,

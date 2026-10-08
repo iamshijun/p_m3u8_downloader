@@ -1,7 +1,7 @@
 // 业务编排: 表单收集 + 任务操作 (添加/取消/删除/刷新/清除)
 import { $, escapeHtml } from "../utils/dom.js";
 import { saveForm } from "../utils/storage.js";
-import { validateM3u8Source } from "../utils/validate.js";
+import { validateM3u8Source, validateResolutionLimit } from "../utils/validate.js";
 import { createTask, createBatchTasks, listTasks, cancelTask, removeTask } from "../api/client.js";
 import { taskCard } from "../components/taskCard.js";
 import { subscribe, unsubscribe, isSubscribed, setOnStreamClosed, setOnStatusChange } from "../components/eventStream.js";
@@ -62,6 +62,7 @@ function collectRequest(overrides = {}) {
     headers: headers,
     key_param: $("key_param").value.trim() || null,
     segments: $("segments").value.trim() || null,
+    resolution: $("resolution").value.trim() || null,
     no_merge: $("no_merge").checked,
     no_disk: $("no_disk").checked,
   };
@@ -86,6 +87,12 @@ async function addTask() {
   if (urlError) {
     alert("M3U8 地址无效: " + urlError);
     $("m3u8_input").focus();
+    return;
+  }
+  const resError = validateResolutionLimit(req.resolution);
+  if (resError) {
+    alert("清晰度上限无效: " + resError);
+    $("resolution").focus();
     return;
   }
 
@@ -254,6 +261,14 @@ async function importTasks() {
 
   // 合并当前表单配置 + 每行解析出的 文件名/URL
   const shared = collectRequest();
+  // 表单级参数 (清晰度上限) 不在逐行校验范围内, 这里单独把关
+  const resError = validateResolutionLimit(shared.resolution);
+  if (resError) {
+    alert("清晰度上限无效: " + resError);
+    closeImportModal();
+    $("resolution").focus();
+    return;
+  }
   const tasks = candidates.map(c => {
     const task = Object.assign({}, shared);
     task.m3u8_input = c.m3u8_input;

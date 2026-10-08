@@ -5,7 +5,7 @@ import { $ } from "./dom.js";
 export const FORM_FIELDS = [
   "m3u8_input", "output", "base_url", 
   //下载相关配置
-  "workers", "retries", "timeout", "proxy", "key_param", "segments", "headers",
+  "workers", "retries", "timeout", "proxy", "key_param", "segments", "resolution", "headers",
   "no_merge", "keep_temp", "no_disk",
   //upload相关
   "upload", "upload_token", "upload_ondup", "upload_retries", "upload_delete",

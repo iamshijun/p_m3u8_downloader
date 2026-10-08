@@ -28,19 +28,27 @@ python3 m3u8_downloader.py <m3u8_file_or_url> [options]
 
 The `CASES` table in that file is the **shared contract** for three places that must change together: `api_server.validate_m3u8_source()`, `web/js/utils/validate.js` `validateM3u8Source()`, and the table itself.
 
+`tests/test_resolution_limit.py` guards the `--resolution` (清晰度上限) contract:
+- `ParseResolutionLimitTest` — `m3u8_downloader.parse_resolution_limit()` (the single parser/validator; `"480p"` → `(None, 480)`, `"854x480"` → `(854, 480)`; invalid raises `ValueError` with a Chinese message)
+- `SelectVariantByLimitTest` — variant selection against a fake `HTTPClient`: height-only cap, dual-dimension cap (a too-wide `1920x480` loses to `854x480`), all-above-limit → `M3U8DownloadError` listing available resolutions, no `RESOLUTION` on any variant → warn + fall back to bandwidth
+- `ValidateResolutionLimitTest` / `DownloadEndpointResolutionTest` — `api_server.validate_resolution_limit()` and the `/api/download` (400) + `/api/download/batch` (per-line `errors`) contract
+
+Its `PARSE_CASES` / `INVALID_CASES` tables are likewise the **shared contract** for `m3u8_downloader.parse_resolution_limit()`, `api_server.validate_resolution_limit()`, `web/js/utils/validate.js` `validateResolutionLimit()`, and the tables themselves — the API/JS layers only re-wrap the downloader's message, so all three must keep returning the same text.
+
 ## Architecture
 
 ```
 dataclasses:
   KeyInfo       — AES-128 key (method, key_uri, key_data, iv)
   M3U8Segment   — single segment (uri, duration, key)
-  M3U8Playlist  — parsed playlist (segments, version, media_sequence, is_encrypted)
+  M3U8Variant   — one stream of a master playlist (uri, bandwidth, width, height, resolution)
+  M3U8Playlist  — parsed playlist (segments, variants, version, media_sequence, is_encrypted)
 
 classes:
   HTTPClient    — wraps urllib.request with proxy/headers/timeout. Methods: get(), get_text()
   M3U8Downloader — orchestrator. Constructor takes all config, run() executes full pipeline
 
-pipeline: fetch → parse → resolve_base_url → load_keys → download_segments → [decrypt] → merge
+pipeline: fetch → parse → [select master variant] → resolve_base_url → load_keys → download_segments → [decrypt] → merge
 ```
 
 When `--no-merge` is set, the merge step is skipped; downloaded segments and the m3u8 file are moved to `{output}_segments/` directory.
@@ -82,12 +90,14 @@ Endpoints:
 ```
 POST   /api/download            — create a task, returns {task_id} (non-blocking);
                                  400 with a Chinese `detail` when `m3u8_input` fails
-                                 `validate_m3u8_source()`
+                                 `validate_m3u8_source()`, or when `resolution` fails
+                                 `validate_resolution_limit()`
 POST   /api/download/batch      — batch create tasks, returns {created, skipped, errors}:
                                  dedupes by URL / sanitized output filename against the
                                  current registry + the batch itself; malformed entries
                                  land in errors (per-line, with optional `line` echoed back),
-                                 including `m3u8_input` scheme validation
+                                 including `m3u8_input` scheme validation and
+                                 `resolution` format validation
 GET    /api/tasks               — list all task snapshots
 GET    /api/tasks/{id}          — single task detail
 GET    /api/tasks/{id}/stream   — NDJSON stream (application/x-ndjson, HTTP Chunked):
@@ -195,12 +205,13 @@ The shell scripts and the systemd unit don't share runtime files — don't run b
 ## Web UI (`web/index.html`)
 
 Single-file frontend served by `api_server.py`. Multi-task download manager:
-- Form covers all `m3u8_downloader` parameters (input, output, base_url, workers, retries, timeout, proxy, headers, key_param, no_merge/keep_temp/no_disk, and the Baidu upload options).
+- Form covers all `m3u8_downloader` parameters (input, output, base_url, workers, retries, timeout, proxy, headers, key_param, segments, resolution, no_merge/keep_temp/no_disk, and the Baidu upload options).
 - "添加下载任务" posts to `/api/download`; each task renders an independent card with its own progress bar, status badge, stats, per-task log, cancel/remove buttons.
 - Each card subscribes to `/api/tasks/{id}/stream` via `fetch` + `ReadableStream` reader, parsing NDJSON line-by-line.
 - On load, `GET /api/tasks` restores existing tasks and reconnects streams for non-terminal ones.
 - **Form memory**: on successful submit, `saveForm()` persists the form to `localStorage["m3u8_last_form"]`; `restoreForm()` refills it on next load (includes `upload_token`).
 - **Source validation (`web/js/utils/validate.js`)**: `validateM3u8Source()` mirrors `api_server.validate_m3u8_source()` — a source with a scheme must be `http`/`https` with a non-empty host (so `hhttps://` is rejected), while a scheme-less string is treated as a local path and passes; `http:/x` (missing `//`) is also flagged. The single-task form validates on submit, and batch import validates every line in `updateImportPreview()`, which disables "导入" and shows the offending line's raw text; `importTasks()` hard-returns before `createBatchTasks()` whenever any line fails, so a bad batch never hits the API. Dedupe `skipped` entries are **not** treated as errors and never block a batch.
+- **Resolution cap validation (`validateResolutionLimit()` in the same file)**: mirrors `m3u8_downloader.parse_resolution_limit()` (empty/absent = unrestricted, `480p` = height only, `854x480` = both dimensions, anything else rejected) and returns the downloader's message, so the user sees the same text as the API. Checked on submit by the single-task form, and once against the shared form config before batch import (`resolution` is a form-level option, so it is not part of the per-line `updateImportPreview()` sweep).
 
 ## Legacy Wrapper scripts
 
@@ -208,7 +219,8 @@ All wrappers pass `"$@"` through to `m3u8_downloader.py`.
 
 ## Key implementation details
 
-- **M3U8 parsing**: `_parse_playlist()` handles `#EXT-X-KEY` with a regex, tracks stateful current_key across segments. Supports METHOD=AES-128, METHOD=NONE.
+- **M3U8 parsing**: `_parse_playlist()` handles `#EXT-X-KEY` with a regex, tracks stateful current_key across segments. Supports METHOD=AES-128, METHOD=NONE. A playlist whose only content is `#EXT-X-STREAM-INF` + URI pairs is a *master playlist* (`is_master`), not an empty one.
+- **Master playlist / resolution cap**: `run()` resolves a master playlist once (`_resolve_master_playlist()`) — it picks a variant, fetches that variant's m3u8, re-points `config.m3u8_source` at it, and continues the normal pipeline. Without `--resolution` it picks the highest by `(pixels, bandwidth)` (`_select_best_variant()`); with `--resolution` (`_select_variant_by_limit()`) it first filters to variants with a known `RESOLUTION` inside the limit — `height <= max_height` **and** (`max_width is None` or `width <= max_width`) — then takes the highest of those. **No variant inside the limit is an error, not a silent downgrade** (`M3U8DownloadError` listing the available resolutions); variants that carry only `BANDWIDTH` make the cap unenforceable, so it warns and falls back to bandwidth. The cap is parsed once in `__init__`, so a malformed value fails before any network I/O. A single-quality playlist has no variant to filter — the cap is logged as ignored.
 - **IV calculation**: explicit `IV=0x...` from KEY tag, or `struct.pack(">Q", media_sequence + i).rjust(16, b"\x00")`.
 - **Decryption**: `_decrypt()` static method — AES-128-CBC + PKCS7 unpadding. Done in `_download_single()` right after download, so segments on disk are already plaintext.
 - **Key caching**: `_load_keys()` caches key bytes by URI — same key URI only downloaded once.

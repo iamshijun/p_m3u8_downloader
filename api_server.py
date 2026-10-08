@@ -75,6 +75,7 @@ from m3u8_downloader import (
     YunpanUploadHook,
     create_upload_hook,
     log,
+    parse_resolution_limit,
     upload_preflight,
 )
 
@@ -166,6 +167,23 @@ def validate_m3u8_source(raw: str) -> Optional[str]:
     return None
 
 
+def validate_resolution_limit(raw: Optional[str]) -> Optional[str]:
+    """校验清晰度上限 (如 480p / 854x480): 合法返回 None, 否则返回可读的中文原因.
+
+    空 / 未指定视为合法 (不限制清晰度, 选最高变体).
+    规则本体在 m3u8_downloader.parse_resolution_limit() (下载器共用), 此处只把
+    它抛出的 ValueError 转成 API 层的中文原因.
+
+    用例表 (共同契约, 改规则时与 web/js/utils/validate.js 一起改):
+    tests/test_resolution_limit.py
+    """
+    try:
+        parse_resolution_limit(raw)
+    except ValueError as e:
+        return str(e)
+    return None
+
+
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
@@ -223,6 +241,7 @@ class DownloadRequest(BaseModel):
     key_param: Optional[str] = Field(None, description="EXT-X-KEY 请求时附加的参数")
     key_format: Optional[str] = Field(None, description="EXT-X-KEY 返回的格式")
     segments: Optional[str] = Field(None, description="只下载指定位置的片段 (0 起始, 逗号分隔, 如 0,3,5); 空则全部")
+    resolution: Optional[str] = Field(None, description="清晰度上限, 如 480p / 854x480; master playlist 中不选高于该值的变体; 空则选最高清晰度")
     no_merge: bool = Field(False, description="不合并, 保留分片目录 + m3u8")
     no_disk: bool = Field(False, description="不落磁盘, 直接推给 upload hook")
 
@@ -667,6 +686,7 @@ class TaskManager:
                 key_param=req.key_param,
                 key_format=req.key_format,
                 segments=req.segments,
+                resolution=req.resolution,
                 quiet=True,
             )
             downloader = M3U8Downloader(
@@ -720,6 +740,9 @@ def download(req: DownloadRequest) -> dict:
     reason = validate_m3u8_source(req.m3u8_input)
     if reason:
         raise HTTPException(status_code=400, detail=reason)
+    res_error = validate_resolution_limit(req.resolution)
+    if res_error:
+        raise HTTPException(status_code=400, detail=res_error)
     task = manager.create(req)
     return {"task_id": task.id, "status": task.status}
 
@@ -765,6 +788,10 @@ def download_batch(req: BatchDownloadRequest) -> dict:
         url_error = validate_m3u8_source(url)
         if url_error:
             errors.append({"line": line_no, "reason": url_error, "input": url})
+            continue
+        res_error = validate_resolution_limit(item.get("resolution"))
+        if res_error:
+            errors.append({"line": line_no, "reason": res_error, "input": url})
             continue
         if not upload_path:
             errors.append({"line": line_no, "reason": "缺少文件名", "input": url})
