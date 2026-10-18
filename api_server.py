@@ -483,6 +483,16 @@ def _safe_name(name: str) -> str:
     return re.sub(r"[^\w.\-]", "_", base)
 
 
+def _remove_empty_dir(path: Optional[str]) -> None:
+    """删除空目录 (非空则不动); 用于兜底清理提前退出时留下的空临时目录."""
+    if not path:
+        return
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass  # 不存在 / 非空 (下载器已接管或 keep_temp)
+
+
 def _run_preflight(hook_type: str, token: str, task: Optional[Task] = None) -> dict:
     """上传预检: 根据后端类型执行认证/连通性检查 (统一走 m3u8_downloader.upload_preflight).
 
@@ -607,15 +617,18 @@ class TaskManager:
             return
 
         task.set_status(TaskStatus.RUNNING)
+        tmp_dir: Optional[str] = None
         try:
             # 每个任务独立目录, 避免输出/临时文件冲突
             task_dir = os.path.join(DOWNLOAD_ROOT, task.id)
             os.makedirs(task_dir, exist_ok=True)
             output_path = os.path.join(task_dir, _safe_name(req.output))
-            tmp_dir = os.path.join(task_dir, "tmp")
-            # 必须显式创建: 下载器对已指定 tmp_dir 的配置不会再 mkdtemp,
-            # 不创建的话每个分片写入都会 FileNotFoundError, 任务全部失败
-            os.makedirs(tmp_dir, exist_ok=True)
+            # 不落盘模式不使用临时目录: 不创建 (下载数据直接交给上传 hook)
+            tmp_dir = None if req.no_disk else os.path.join(task_dir, "tmp")
+            if tmp_dir:
+                # 必须显式创建: 下载器对已指定 tmp_dir 的配置不会再 mkdtemp,
+                # 不创建的话每个分片写入都会 FileNotFoundError, 任务全部失败
+                os.makedirs(tmp_dir, exist_ok=True)
 
             task.emit({"type": "start", "input": req.m3u8_input, "output": output_path})
 
@@ -716,6 +729,9 @@ class TaskManager:
         except Exception as e:
             task.error = str(e)
             task.set_status(TaskStatus.ERROR, message=task.error, exception=type(e).__name__)
+        finally:
+            # 兜底: 预检失败/提前退出时清掉已经建成但没用到的临时目录
+            _remove_empty_dir(tmp_dir)
 
 
 manager = TaskManager(MAX_CONCURRENT)

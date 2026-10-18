@@ -718,13 +718,26 @@ class M3U8Downloader:
         self._resolution_limit = parse_resolution_limit(config.resolution)
 
         # 内部状态
-        # 下载的m3u8文件存放的临时路径 (ps:完成后暂时不会被删除)
+        # 下载的m3u8文件存放的临时路径 (run() 结束时删除)
         self._tmp_m3u8_path: Optional[str] = None
+        # 本次运行是否真的使用了临时目录 (只有用到才需要在 _cleanup 里删)
+        self._tmp_dir_in_use = False
 
     # -- public API ----------------------------------------------------------
 
     def run(self) -> str:
-        """执行完整下载流程, 返回输出文件/目录路径."""
+        """执行完整下载流程, 返回输出文件/目录路径.
+
+        无论成功/失败/取消, 都会在 finally 中清理本次下载占用的临时文件
+        (keep_temp 时保留); 不落盘模式不创建临时目录.
+        """
+        try:
+            return self._run_pipeline()
+        finally:
+            self._cleanup()
+
+    def _run_pipeline(self) -> str:
+        """run() 的主体: 获取 → 解析 → 下载 → hooks."""
         playlist = self._fetch_playlist()
 
         # master playlist: 自动选择最高清晰度变体后, 重新解析其 m3u8 走正常流程
@@ -756,11 +769,11 @@ class M3U8Downloader:
             if not ctx.should_continue:
                 break
 
-        if not self.config.tmp_dir: #如果没有指定创建一个
-            self.config.tmp_dir = tempfile.mkdtemp(prefix="m3u8_dl_")
-        log(f"[*] 临时目录: {self.config.tmp_dir}")
         # -- no_disk 模式: 下载后直接 on_segment_data, 不写磁盘 -------------------
+        # 该模式不创建临时目录 (数据在内存中直接交给 hook), 也不做目录清理
         if self.config.no_disk:
+            if self.config.keep_temp:
+                log("[!] --no-disk 不产生临时目录, --keep-temp 在该模式下无效")
             self._download_segments_no_disk(playlist)
             result = self.config.output
             ctx = HookContext(result_path=result)
@@ -768,10 +781,13 @@ class M3U8Downloader:
                 hook.on_finish(ctx)
                 if not ctx.should_continue:
                     break
-            self._cleanup()
             return result
 
-        # -- 正常流程 ---------------------------------------------------------
+        # -- 正常流程: 需要临时目录存放分片 -------------------------------
+        if not self.config.tmp_dir: #如果没有指定创建一个
+            self.config.tmp_dir = tempfile.mkdtemp(prefix="m3u8_dl_")
+        self._tmp_dir_in_use = True
+        log(f"[*] 临时目录: {self.config.tmp_dir}")
 
         # 注入 m3u8 文件路径到 merge hook (no-merge 模式需要)
         self._inject_m3u8_context()
@@ -822,7 +838,6 @@ class M3U8Downloader:
             if not ctx.should_continue:
                 break
 
-        self._cleanup()
         return result
 
     # -- fetch & parse -------------------------------------------------------
@@ -832,6 +847,9 @@ class M3U8Downloader:
         if urlparse(self.config.m3u8_source).scheme in ("http", "https"):
             log(f"[*] 下载 m3u8 文件: {self.config.m3u8_source}")
             content = self.http.get_text(self.config.m3u8_source, max_bytes=MAX_PLAYLIST_BYTES)
+            if self.config.no_disk:
+                # 不落盘模式: 不在磁盘上留 m3u8 副本 (没有消费者)
+                return self._parse_playlist(content)
             with tempfile.NamedTemporaryFile(
                 mode="w", suffix=".m3u8", delete=False, encoding="utf-8"
             ) as tmp:
@@ -867,16 +885,19 @@ class M3U8Downloader:
         content = self.http.get_text(variant_url, max_bytes=MAX_PLAYLIST_BYTES)
 
         # 用变体 m3u8 内容替换 _tmp_m3u8_path (供 no-merge 模式拷贝 playlist.m3u8)
+        # 不落盘模式不需要磁盘副本
         if self._tmp_m3u8_path and os.path.exists(self._tmp_m3u8_path):
             try:
                 os.unlink(self._tmp_m3u8_path)
             except OSError:
                 pass
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".m3u8", delete=False, encoding="utf-8"
-        ) as tmp:
-            tmp.write(content)
-            self._tmp_m3u8_path = tmp.name
+            self._tmp_m3u8_path = None
+        if not self.config.no_disk:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".m3u8", delete=False, encoding="utf-8"
+            ) as tmp:
+                tmp.write(content)
+                self._tmp_m3u8_path = tmp.name
 
         # 更新源: 后续 _resolve_base_url 会基于变体 URL 重新推导 base_url
         # 重置 base_url, 确保变体 m3u8 内的相对分片 URL 能正确解析到变体所在目录
@@ -1295,17 +1316,26 @@ class M3U8Downloader:
     # -- cleanup -------------------------------------------------------------
 
     def _cleanup(self) -> None:
-        """清理临时文件."""
-        if self.config.keep_temp:
-            if self.config.tmp_dir:
+        """清理临时文件 (幂等).
+
+        只清理本次运行真正用过的临时目录: 不落盘模式没用过临时目录, 因此
+        既不会创建也不会删除 (包括用户用 --tmp-dir 指定的目录).
+        """
+        if self._tmp_dir_in_use and self.config.tmp_dir:
+            if self.config.keep_temp:
                 log(f"[*] 临时文件保留在: {self.config.tmp_dir}")
-        else:
-            log("[*] 清理临时文件...")
-            if self.config.tmp_dir:
+            else:
+                log("[*] 清理临时文件...")
                 shutil.rmtree(self.config.tmp_dir, ignore_errors=True)
-                
-        if self._tmp_m3u8_path and os.path.exists(self._tmp_m3u8_path):
-            os.unlink(self._tmp_m3u8_path)
+            self._tmp_dir_in_use = False
+
+        if self._tmp_m3u8_path:
+            try:
+                if os.path.exists(self._tmp_m3u8_path):
+                    os.unlink(self._tmp_m3u8_path)
+            except OSError:
+                pass
+            self._tmp_m3u8_path = None
 
 
 # ---------------------------------------------------------------------------

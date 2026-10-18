@@ -49,6 +49,8 @@ The `CASES` table in that file is the **shared contract** for three places that 
 
 Its `PARSE_CASES` / `INVALID_CASES` tables are likewise the **shared contract** for `m3u8_downloader.parse_resolution_limit()`, `api_server.validate_resolution_limit()`, `web/js/utils/validate.js` `validateResolutionLimit()`, and the tables themselves — the API/JS layers only re-wrap the downloader's message, so all three must keep returning the same text.
 
+`tests/test_no_disk_tmpdir.py` guards the temp-dir contract of `--no-disk`: no_disk mode never calls `mkdtemp` / `NamedTemporaryFile` (`config.tmp_dir` stays `None`), while the normal path creates exactly one temp dir that `run()` removes even when a hook raises (cleanup lives in `run()`'s `finally`, not in `_finalize()`).
+
 ## Architecture
 
 ```
