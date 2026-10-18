@@ -2,6 +2,20 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Agent skills
+
+### Issue tracker
+
+Issues and specs live as markdown files under `.scratch/<feature-slug>/` in this repo. See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Five canonical triage roles, recorded as `Status:` lines in issue files (default label names). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
 ## Project overview
 
 A single-file Python CLI tool (`m3u8_downloader.py`) that downloads HLS video streams from M3U8 playlists, with AES-128 decryption support. Zero required dependencies beyond Python stdlib. Optional deps: `tqdm` (progress bar), `pycryptodome` (AES decryption).
