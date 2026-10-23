@@ -678,7 +678,7 @@ class DownloadConfig:
     no_disk: bool = False
     key_param: Optional[str] = None
     key_format: Optional[str] = None
-    segments: Optional[str] = None  # 只下载指定位置的片段, 0 起始, 逗号分隔, 如 "0,3,5"; 空则全部
+    segments: Optional[str] = None  # 只下载指定位置的片段, 0 起始: "0,3,5" 单个, "10-20" 区间, "1600-" 到末尾; 空则全部
     resolution: Optional[str] = None  # 清晰度上限, 如 "480p" / "854x480"; 空则选最高清晰度变体
     quiet: bool = False
 
@@ -748,7 +748,7 @@ class M3U8Downloader:
             log(f"[*] 非 master playlist (单一清晰度), 清晰度上限 "
                 f"{format_resolution_limit(self._resolution_limit)} 无法应用, 已忽略")
 
-        # 指定片段过滤: 只保留指定位置的片段 (0 起始, 逗号分隔), 其余过滤掉
+        # 指定片段过滤: 只保留指定位置的片段 (0 起始; 支持 0,3,5 / 10-20 / 1600-), 其余过滤掉
         self._apply_segment_filter(playlist)
 
         if not playlist.segments:
@@ -1044,44 +1044,65 @@ class M3U8Downloader:
     # -- segment filtering ----------------------------------------------------
 
     @staticmethod
-    def _parse_segment_indices(spec: Optional[str]) -> Optional[set[int]]:
-        """解析片段位置列表: 0 起始, 逗号分隔, 如 "0,3,5".
+    def _parse_segment_ranges(spec: Optional[str]) -> Optional[list[tuple[int, Optional[int]]]]:
+        """解析片段位置表达式, 返回 [(start, end)] 闭区间列表; end 为 None 表示到末尾.
 
-        空/None 返回 None (表示不限制); 非法项忽略并告警.
+        "0,3,5"  → [(0, 0), (3, 3), (5, 5)]   单个位置
+        "10-20"  → [(10, 20)]                 区间 (闭区间)
+        "1600-"  → [(1600, None)]             从 1600 到最后一个片段
+        空/None  → None                       不限制 (全部下载)
+        非法项   → 告警后忽略
         """
         if not spec or not spec.strip():
             return None
-        indices: set[int] = set()
+        ranges: list[tuple[int, Optional[int]]] = []
         for part in spec.split(","):
             part = part.strip()
             if not part:
                 continue
-            if not part.isdigit():
-                log(f"[!] 忽略无效的片段位置: {part!r}")
+            if part.isdigit():
+                ranges.append((int(part), int(part)))
                 continue
-            indices.add(int(part))
-        return indices or None
+            start_text, sep, end_text = part.partition("-")
+            if sep and start_text.strip().isdigit() and not end_text.strip():
+                # "1600-": 从 1600 一直到最后一个片段
+                ranges.append((int(start_text), None))
+                continue
+            if sep and start_text.strip().isdigit() and end_text.strip().isdigit():
+                start, end = int(start_text), int(end_text)
+                if start <= end:
+                    ranges.append((start, end))
+                    continue
+                log(f"[!] 忽略无效的片段区间 (起点大于终点): {part!r}")
+                continue
+            log(f"[!] 忽略无效的片段位置: {part!r}")
+        return ranges or None
 
     def _apply_segment_filter(self, playlist: M3U8Playlist) -> None:
         """按 config.segments 只保留指定位置的片段, 其余过滤掉 (原地修改 playlist).
 
-        位置从 0 开始. 片段的原始序号 (M3U8Segment.index) 保持不变:
+        位置从 0 开始; 支持单个位置 (0,3,5)、区间 (10-20) 和开区间 (1600- = 到末尾).
+        片段的原始序号 (M3U8Segment.index) 保持不变:
         分片文件名/合并/进度上报/派生 IV 均按原始序号处理, 过滤后序号不连续.
         """
-        indices = self._parse_segment_indices(self.config.segments)
-        if indices is None:
+        ranges = self._parse_segment_ranges(self.config.segments)
+        if ranges is None:
             return
         total = len(playlist.segments)
 
-        valid = sorted(i for i in indices if i < total)
-        for i in sorted(i for i in indices if i >= total):
-            log(f"[!] 片段位置 {i} 超出范围 (共 {total} 个片段), 已忽略")
-        if not valid:
+        selected: set[int] = set()
+        for start, end in ranges:
+            if start >= total:
+                label = f"{start}-" if end is None else (f"{start}-{end}" if end != start else str(start))
+                log(f"[!] 片段位置 {label} 超出范围 (共 {total} 个片段), 已忽略")
+                continue
+            stop = total - 1 if end is None else min(end, total - 1)
+            selected.update(range(start, stop + 1))
+        if not selected:
             raise M3U8DownloadError(f"[!] 指定的片段位置均超出范围 (共 {total} 个片段)")
 
-        selected = set(valid)
         playlist.segments = [seg for idx, seg in enumerate(playlist.segments) if idx in selected]
-        log(f"[*] 仅下载指定片段 {valid} (共 {len(playlist)} 个)")
+        log(f"[*] 仅下载指定片段 {self.config.segments.strip()} (共 {len(playlist)}/{total} 个)")
 
     # -- base_url ------------------------------------------------------------
 
@@ -1370,7 +1391,8 @@ def main() -> None:
     parser.add_argument("--retries", "-r", type=int, default=3, help="下载失败重试次数 (默认: 3)")
     parser.add_argument("--key-param", default=None, help="EXT-X-KEY 请求时附加的参数")
     parser.add_argument("--key-format", default=None, help="EXT-X-KEY 返回的格式")
-    parser.add_argument("--segments", default=None, help="只下载指定位置的片段 (0 起始, 逗号分隔, 如 0,3,5); 默认全部下载")
+    parser.add_argument("--segments", default=None,
+                        help="只下载指定位置的片段 (0 起始): 0,3,5 单个位置; 10-20 区间; 1600- 从 1600 到末尾; 默认全部下载")
     parser.add_argument("--resolution", default=None,
                         help="清晰度上限, 如 480p 或 854x480; master playlist 中不选择高于该值的变体 (默认: 最高清晰度)")
     parser.add_argument("--no-merge", action="store_true", help="不合并片段, 仅下载到目录并保留 m3u8 文件")

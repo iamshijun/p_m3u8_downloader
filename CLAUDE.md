@@ -51,6 +51,8 @@ Its `PARSE_CASES` / `INVALID_CASES` tables are likewise the **shared contract** 
 
 `tests/test_no_disk_tmpdir.py` guards the temp-dir contract of `--no-disk`: no_disk mode never calls `mkdtemp` / `NamedTemporaryFile` (`config.tmp_dir` stays `None`), while the normal path creates exactly one temp dir that `run()` removes even when a hook raises (cleanup lives in `run()`'s `finally`, not in `_finalize()`).
 
+`tests/test_segment_filter.py` guards `--segments` (片段过滤): `ParseSegmentRangesTest` covers `M3U8Downloader._parse_segment_ranges()` (`"0,3,5"` → singles, `"10-20"` → inclusive range, `"1600-"` → to the end, invalid items warned + dropped), `ApplySegmentFilterTest` covers `_apply_segment_filter()` (range clipped at the tail, out-of-range start warned + ignored, all out of range → `M3U8DownloadError`, `M3U8Segment.index` keeps the original playlist position after filtering).
+
 ## Architecture
 
 ```
@@ -235,6 +237,7 @@ All wrappers pass `"$@"` through to `m3u8_downloader.py`.
 
 ## Key implementation details
 
+- **Segment filtering (`--segments`)**: `_parse_segment_ranges()` is the single parser — `"0,3,5"` singles, `"10-20"` inclusive range, `"1600-"` from 1600 to the last segment, empty/absent = no filter. Invalid items (`"abc"`, `"20-10"`, `"-5"`) are warned about and skipped rather than failing the run; `_apply_segment_filter()` then clips ranges at the tail, drops out-of-range starts with a warning, and raises `M3U8DownloadError` only when nothing is selected. `M3U8Segment.index` keeps the original playlist position, so segment filenames / merge order / derived IV are unaffected by filtering. The API and web form pass the string through unchanged (no separate validation layer).
 - **M3U8 parsing**: `_parse_playlist()` handles `#EXT-X-KEY` with a regex, tracks stateful current_key across segments. Supports METHOD=AES-128, METHOD=NONE. A playlist whose only content is `#EXT-X-STREAM-INF` + URI pairs is a *master playlist* (`is_master`), not an empty one.
 - **Master playlist / resolution cap**: `run()` resolves a master playlist once (`_resolve_master_playlist()`) — it picks a variant, fetches that variant's m3u8, re-points `config.m3u8_source` at it, and continues the normal pipeline. Without `--resolution` it picks the highest by `(pixels, bandwidth)` (`_select_best_variant()`); with `--resolution` (`_select_variant_by_limit()`) it first filters to variants with a known `RESOLUTION` inside the limit — `height <= max_height` **and** (`max_width is None` or `width <= max_width`) — then takes the highest of those. **No variant inside the limit is an error, not a silent downgrade** (`M3U8DownloadError` listing the available resolutions); variants that carry only `BANDWIDTH` make the cap unenforceable, so it warns and falls back to bandwidth. The cap is parsed once in `__init__`, so a malformed value fails before any network I/O. A single-quality playlist has no variant to filter — the cap is logged as ignored.
 - **IV calculation**: explicit `IV=0x...` from KEY tag, or `struct.pack(">Q", media_sequence + i).rjust(16, b"\x00")`.
