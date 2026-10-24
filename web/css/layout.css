@@ -24,10 +24,15 @@ h2 {
   font-size: 15px;
   color: var(--muted);
   margin: 0 0 12px 0;
-  display: flex;
-  justify-content: space-between;
+  /* 三栏栅格: 左标题 / 中统计 / 右按钮组.
+     两侧同为 1fr, 所以中间的统计是真正的水平居中 (不依赖两侧内容等宽) */
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr);
   align-items: center;
+  gap: 8px 14px;
 }
+h2 > .task-summary { justify-self: center; }
+h2 > .btn-group { justify-self: end; }
 
 /* 面板与栅格 */
 .panel {
@@ -67,7 +72,15 @@ input:focus, textarea:focus, select:focus {
   border-color: var(--accent);
 }
 
-/* 选项组与按钮行 */
+/* 按钮行: 窄屏放不下时自动shrink */
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 16px;
+}
+.actions > button { flex: 0 1 auto; }
+
 .checks {
   display: flex;
   flex-wrap: wrap;
@@ -82,11 +95,6 @@ input:focus, textarea:focus, select:focus {
   font-size: 13px;
   cursor: pointer;
   margin: 0;
-}
-.actions {
-  display: flex;
-  gap: 10px;
-  margin-top: 16px;
 }
 
 /* details 折叠 */
@@ -103,4 +111,28 @@ details summary {
   font-size: 13px;
   text-align: center;
   padding: 20px;
+}
+
+/* ---------------- 响应式: 窄屏 (手机) ----------------
+   断点 720px: 按钮文字较长 → 按钮行 2x2; 任务列表标题栏的按钮组放到第二行铺满整宽.
+   表单 .grid 保持两列 (都是短数值, 单列表反而浪费高度). */
+@media (max-width: 720px) {
+  .container { padding: 16px 12px; }
+  .panel { padding: 16px 14px; }
+  .actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+  .actions > button { width: 100%; flex: none; }
+  /* h2: 标题 + 统计同排 (统计靠右), 按钮组独占第二行并铺满 */
+  h2 {
+    grid-template-columns: auto minmax(0, 1fr);
+    grid-template-areas:
+      "title summary"
+      "group group";
+  }
+  h2 > .h2-title { grid-area: title; }
+  h2 > .task-summary { grid-area: summary; justify-self: end; }
+  h2 > .btn-group { grid-area: group; justify-self: stretch; }
+  h2 > .btn-group > button { flex: 1; }
 }

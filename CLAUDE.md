@@ -117,6 +117,9 @@ POST   /api/download/batch      — batch create tasks, returns {created, skippe
                                  including `m3u8_input` scheme validation and
                                  `resolution` format validation
 GET    /api/tasks               — list all task snapshots
+POST   /api/tasks/cancel-pending — cancel every still-queued (`pending`) task in one
+                                 call, returns `{cancelled: [task_id], count}`;
+                                 `running` / terminal tasks are untouched
 GET    /api/tasks/{id}          — single task detail
 GET    /api/tasks/{id}/stream   — NDJSON stream (application/x-ndjson, HTTP Chunked):
                                   replays event history, then pushes live events
@@ -230,6 +233,9 @@ Single-file frontend served by `api_server.py`. Multi-task download manager:
 - **Form memory**: on successful submit, `saveForm()` persists the form to `localStorage["m3u8_last_form"]`; `restoreForm()` refills it on next load (includes `upload_token`).
 - **Source validation (`web/js/utils/validate.js`)**: `validateM3u8Source()` mirrors `api_server.validate_m3u8_source()` — a source with a scheme must be `http`/`https` with a non-empty host (so `hhttps://` is rejected), while a scheme-less string is treated as a local path and passes; `http:/x` (missing `//`) is also flagged. The single-task form validates on submit, and batch import validates every line in `updateImportPreview()`, which disables "导入" and shows the offending line's raw text; `importTasks()` hard-returns before `createBatchTasks()` whenever any line fails, so a bad batch never hits the API. Dedupe `skipped` entries are **not** treated as errors and never block a batch.
 - **Resolution cap validation (`validateResolutionLimit()` in the same file)**: mirrors `m3u8_downloader.parse_resolution_limit()` (empty/absent = unrestricted, `480p` = height only, `854x480` = both dimensions, anything else rejected) and returns the downloader's message, so the user sees the same text as the API. Checked on submit by the single-task form, and once against the shared form config before batch import (`resolution` is a form-level option, so it is not part of the per-line `updateImportPreview()` sweep).
+- **Layout / responsive (`web/css/layout.css`)**: the task-list `h2` is a 3-track grid (`minmax(0,1fr) auto minmax(0,1fr)`) so 「运行中/等待中/总计」 is *truly* centered regardless of the title / button-group widths; `@media (max-width: 720px)` keeps the form `.grid` two-column (all short numeric fields) but turns `.actions` into a `1fr 1fr` (2×2) grid — the button labels are long — and moves the `h2` button group to its own full-width row via `grid-template-areas` (`.btn-group` is a segmented control: `inline-flex` + 1px gap, rounded only on the outer corners).
+- **Export pending (`导出等待中` → `exportPending()`)**: fetches `/api/tasks`, keeps only `pending` tasks, and downloads them as `pending-<epoch-ms>.txt` — one `文件名 URL` line per task, byte-for-byte the same shape `parseImportText()` accepts, so the file round-trips through 「选择 .txt 文件」. The first field is `snapshot.upload` (the remote upload path) falling back to `snapshot.output`, with whitespace collapsed to `_` to keep the two-field line unambiguous. Built client-side via `Blob` + `URL.createObjectURL`, no backend endpoint and no new modal.
+- **Cancel all pending (`取消全部等待中` → `cancelAllPending()`)**: confirms the count from a fresh `/api/tasks` snapshot, then makes one `POST /api/tasks/cancel-pending` call and applies the returned ids (`taskCard.setStatus()`) before `refresh()`. Deliberately **not** N × `cancelTask()` — a 500-task batch would otherwise fire 500 requests. `running` tasks are intentionally excluded (they'd need the `CancelHook` path one by one, still available via the per-card 取消 button).
 
 ## Legacy Wrapper scripts
 

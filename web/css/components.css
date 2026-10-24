@@ -19,6 +19,17 @@ button.small {
 }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 
+/* 按钮组: 贴合排列的次级按钮, 1px 分隔缝 + 外圆角 (分段控件观感) */
+.btn-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+}
+.btn-group > button { border-radius: 0; }
+.btn-group > button:first-child { border-radius: 4px 0 0 4px; }
+.btn-group > button:last-child { border-radius: 0 4px 4px 0; }
+.btn-group > button:hover:not(:disabled) { background: #475569; }
+
 /* 进度条 */
 .progress-wrap {
   height: 18px;

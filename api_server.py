@@ -20,6 +20,7 @@
     POST   /api/download              → 创建下载任务, 返回 {task_id}
     POST   /api/download/batch        → 批量创建下载任务, 返回 {created, skipped, errors}
     GET    /api/tasks                 → 列出所有任务 (状态快照)
+    POST   /api/tasks/cancel-pending  → 取消所有排队中 (pending) 的任务
     GET    /api/tasks/{id}            → 单个任务详情
     GET    /api/tasks/{id}/stream     → StreamingResponse(NDJSON) 订阅进度 (先回放历史再实时)
     POST   /api/tasks/{id}/cancel     → 请求取消 (尽力而为)
@@ -565,6 +566,18 @@ class TaskManager:
             task.set_status(TaskStatus.CANCELLED, reason="用户取消")
         return True
 
+    def cancel_pending(self) -> list[str]:
+        """取消所有仍在排队 (pending) 的任务, 返回被取消的 task_id 列表.
+
+        已 running / 已终态的任务不受影响; 先快照再逐个 cancel, 避免持锁调用."""
+        with self._lock:
+            pending_ids = [tid for tid, t in self._tasks.items() if t.status is TaskStatus.PENDING]
+        cancelled: list[str] = []
+        for tid in pending_ids:
+            if self.cancel(tid):
+                cancelled.append(tid)
+        return cancelled
+
     def remove(self, task_id: str) -> bool:
         with self._lock:
             task = self._tasks.get(task_id)
@@ -838,6 +851,13 @@ def download_batch(req: BatchDownloadRequest) -> dict:
 @app.get("/api/tasks")
 def list_tasks() -> dict:
     return {"tasks": manager.list()}
+
+
+@app.post("/api/tasks/cancel-pending")
+def cancel_pending_tasks() -> dict:
+    """取消所有排队中 (pending) 的任务; running / 已终态的不受影响."""
+    cancelled = manager.cancel_pending()
+    return {"cancelled": cancelled, "count": len(cancelled)}
 
 
 @app.get("/api/tasks/{task_id}")

@@ -2,7 +2,7 @@
 import { $, escapeHtml } from "../utils/dom.js";
 import { saveForm } from "../utils/storage.js";
 import { validateM3u8Source, validateResolutionLimit } from "../utils/validate.js";
-import { createTask, createBatchTasks, listTasks, cancelTask, removeTask } from "../api/client.js";
+import { createTask, createBatchTasks, listTasks, cancelTask, cancelPendingTasks, removeTask } from "../api/client.js";
 import { taskCard } from "../components/taskCard.js";
 import { subscribe, unsubscribe, isSubscribed, setOnStreamClosed, setOnStatusChange } from "../components/eventStream.js";
 
@@ -175,6 +175,70 @@ async function clearDone() {
   updateSummary();
 }
 
+// ---- 等待中 (pending) 任务的两项批量操作: 导出 / 全部取消 ----
+
+// 拉一次最新的任务列表; 失败时提示并返回 null
+async function fetchTasksOrAlert() {
+  try {
+    const { tasks = [] } = await listTasks();
+    return tasks;
+  } catch (e) {
+    alert("获取任务列表失败: " + e.message);
+    return null;
+  }
+}
+
+// 单行导出文本: 与批量导入格式一致 ("文件名 URL")
+// 文件名优先用上传路径, 没配上传时退回输出文件名; 空白折叠为 _ 以免破坏两段式格式
+function pendingLine(t) {
+  const name = String(t.upload || t.output || "").trim().replace(/\s+/g, "_") || "output.ts";
+  return `${name} ${t.input}`;
+}
+
+// 导出当前 pending 任务, 下载为 .txt (可直接用批量导入的"选择 .txt 文件"导回)
+async function exportPending() {
+  const list = await fetchTasksOrAlert();
+  if (!list) return;
+  const lines = list.filter(t => t.status === "pending").map(pendingLine);
+  if (!lines.length) { alert("没有等待中的任务"); return; }
+
+  const blob = new Blob([lines.join("\n") + "\n"], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `pending-${Date.now()}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+// 取消所有排队中的任务 (running / 已终态不受影响), 由后端一次性处理
+async function cancelAllPending() {
+  const list = await fetchTasksOrAlert();
+  if (!list) return;
+  const pending = list.filter(t => t.status === "pending");
+  if (!pending.length) { alert("没有等待中的任务"); return; }
+  if (!confirm(`确定要取消 ${pending.length} 个等待中的任务吗?`)) return;
+
+  const btn = $("btnCancelPending");
+  btn.disabled = true;
+  try {
+    const { cancelled = [] } = await cancelPendingTasks();
+    for (const id of cancelled) {
+      if (taskCard.has(id)) taskCard.setStatus(id, "cancelled");
+      knownStatuses.set(id, "cancelled");
+    }
+    refresh();  // 未渲染的卡片走一次列表刷新补齐终态
+  } catch (e) {
+    alert("批量取消失败: " + e.message);
+  } finally {
+    btn.disabled = false;
+    updateSummary();
+    syncPoll();
+  }
+}
+
 // ---- 批量导入 ----
 
 // 解析导入文本: 每行 "文件名 URL" (空白分隔), 格式/URL 不合法计入 errors
@@ -318,6 +382,8 @@ export function bindPage() {
   $("btnAdd").addEventListener("click", addTask);
   $("btnRefresh").addEventListener("click", refresh);
   $("btnClearDone").addEventListener("click", clearDone);
+  $("btnExportPending").addEventListener("click", exportPending);
+  $("btnCancelPending").addEventListener("click", cancelAllPending);
   $("btnImport").addEventListener("click", openImportModal);
   $("btnImportCancel").addEventListener("click", closeImportModal);
   $("btnImportOk").addEventListener("click", importTasks);

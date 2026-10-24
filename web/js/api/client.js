@@ -66,6 +66,12 @@ export async function cancelTask(id) {
   return jsonOrThrow(resp);
 }
 
+// 取消所有排队中 (pending) 的任务. 返回 { cancelled: [task_id], count }
+export async function cancelPendingTasks() {
+  const resp = await fetch("api/tasks/cancel-pending", { method: "POST" });
+  return jsonOrThrow(resp);
+}
+
 // 删除已结束的任务
 export async function removeTask(id) {
   return fetch(`api/tasks/${id}`, { method: "DELETE" });
