@@ -1438,7 +1438,8 @@ def main() -> None:
     if args.upload:
         token = _load_token(args.upload_token)
         if not token:
-            log("[!] 启用 --upload 但未提供 ACCESS_TOKEN, 请用 --upload-token 指定或写入 .env")
+            log("[!] 启用 --upload 但未提供 token: 请用 --upload-token 指定, "
+                "或写入 .env 的 ACCESS_TOKEN 作为兜底")
             sys.exit(1)
         # 下载前预检: token 失效 / 网络故障在此提前失败, 避免下载完才发现无法上传
         try:

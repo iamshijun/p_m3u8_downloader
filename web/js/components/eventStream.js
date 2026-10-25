@@ -68,7 +68,8 @@ function dispatch(t, ev) {
         if (ev.result) { t.resultWrap.style.display = ""; t.resultEl.textContent = ev.result; }
         if (ev.size != null) t.sizeEl.textContent = humanSize(ev.size);
       } else if (ev.status === "error") {
-        taskCard.log(t.id, "✘ 错误: " + (ev.message || ""), "l-err");
+        // 内联错误块 + 日志行统一由 taskCard.setError 输出 (幂等)
+        taskCard.setError(t.id, ev.message || "未知错误");
       } else if (ev.status === "cancelled") {
         taskCard.log(t.id, "已取消 (" + (ev.reason || "") + ")", "l-warn");
       } else if (ev.status === "running") {

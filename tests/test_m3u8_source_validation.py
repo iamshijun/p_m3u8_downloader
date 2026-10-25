@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import os
 import unittest
 from unittest import mock
 
@@ -132,6 +133,12 @@ class DownloadEndpointValidationTest(unittest.TestCase):
         self._patch = mock.patch.object(api_server, "manager", self.fake)
         self._patch.start()
         self.addCleanup(self._patch.stop)
+        # 批量行通常都带 upload path, 而创建任务时会先校验上传 token
+        # (api_server.validate_task_upload). 这些用例只关心 URL 校验/重复判定,
+        # 给一个兜底 token 让 token 校验不干扰被测行为.
+        env = mock.patch.dict(os.environ, {"ACCESS_TOKEN": "test-token"})
+        env.start()
+        self.addCleanup(env.stop)
 
     # -- 单条 ----------------------------------------------------------------
 

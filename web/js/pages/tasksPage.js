@@ -44,6 +44,19 @@ function syncPoll() {
   }
 }
 
+// 上传选项 (不含 path): path 决定"是否上传"、以及批量导入时每行的远程文件名,
+// 其余选项 (token/ondup/重试/删分片) 一律跟着表单走.
+// token 优先级: 这里的值 (前端) > .env 的 ACCESS_TOKEN (仅兜底)
+function collectUploadOptions() {
+  return {
+    type: "yunpan",
+    token: $("upload_token").value.trim() || null,
+    ondup: $("upload_ondup").value,
+    max_retries: parseInt($("upload_retries").value) || 5,
+    delete_after_upload: $("upload_delete").checked,
+  };
+}
+
 function collectRequest(overrides = {}) {
   const headersRaw = $("headers").value.trim();
   const headers = headersRaw
@@ -68,14 +81,8 @@ function collectRequest(overrides = {}) {
   };
   const uploadPath = $("upload").value.trim();
   if (uploadPath) {
-    req.upload = {
-      type: "yunpan",
-      path: uploadPath,
-      token: $("upload_token").value.trim() || null,
-      ondup: $("upload_ondup").value,
-      max_retries: parseInt($("upload_retries").value) || 5,
-      delete_after_upload: $("upload_delete").checked,
-    };
+    // path 决定"是否上传": 远程目录留空则本次任务不上传
+    req.upload = Object.assign(collectUploadOptions(), { path: uploadPath });
   }
   return Object.assign(req, overrides);
 }
@@ -271,7 +278,12 @@ function parseImportText(text) {
 function updateImportPreview() {
   const { candidates, errors } = parseImportText($("importText").value);
   const bits = [];
-  if (candidates.length) bits.push(candidates.length + " 条有效");
+  if (candidates.length) {
+    bits.push(candidates.length + " 条有效");
+    // 批量导入的每行都会走上传 (远程路径 = 行首文件名): 提前告知 token 从哪来,
+    // 表单没填就只剩 .env 的 ACCESS_TOKEN 兜底 (没配则每行都会失败).
+    bits.push($("upload_token").value.trim() ? "token: 表单" : "token: 仅 .env 兜底");
+  }
   if (errors.length) bits.push(errors.length + " 条校验未通过");
   $("importPreview").textContent = bits.length ? bits.join("，") : "";
   const errBox = $("importErrors");
@@ -337,14 +349,13 @@ async function importTasks() {
     const task = Object.assign({}, shared);
     task.m3u8_input = c.m3u8_input;
     task.line = c.line;
-    // 保留表单中的上传配置 (token/ondup/max_retries/delete_after_upload)
-    // 仅将 path 替换为导入的文件名
+    // 保留表单中的上传配置 (token/ondup/max_retries/delete_after_upload),
+    // 仅将 path 替换为导入的文件名.
+    // 每次都用 collectUploadOptions() 重新读表单 (不用 shared.upload 继承),
+    // 避免"远程目录留空时 shared 里没有 upload" / "继承了旧对象" 这类丢 token 的坑;
+    // 表单真没填 token 时交给后端用 .env 的 ACCESS_TOKEN 兜底.
     if (c.upload) {
-      if (task.upload && typeof task.upload === 'object') {
-        task.upload = Object.assign({}, task.upload, { path: c.upload });
-      } else {
-        task.upload = { type: "yunpan", path: c.upload };
-      }
+      task.upload = Object.assign({}, collectUploadOptions(), { path: c.upload });
     }
     return task;
   });
@@ -355,6 +366,13 @@ async function importTasks() {
     const out = $("importResult");
     const lines = [];
     lines.push(`<div class="ok">成功创建 ${created.length} 个任务</div>`);
+    // 回显服务端实际使用的 token 来源: 表单/请求 > .env 兜底. 直接告诉你
+    // "我填的 token 用上了没", 不用再去挖请求体.
+    const sources = [...new Set(created.map(c => c.token_source).filter(Boolean))];
+    if (sources.length) {
+      const label = sources.map(s => s === "task" ? "表单/请求里的 token" : ".env 的 ACCESS_TOKEN (兜底)").join(" / ");
+      lines.push(`<div class="hint" style="margin-top:4px">上传 token 来源: ${escapeHtml(label)}</div>`);
+    }
     if (skipped.length) {
       lines.push(`<div class="warn">跳过 ${skipped.length} 个:</div>`);
       for (const s of skipped.slice(0, 50))

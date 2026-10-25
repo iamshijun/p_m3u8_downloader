@@ -345,6 +345,11 @@ class DownloadEndpointResolutionTest(unittest.TestCase):
         self._patch = mock.patch.object(api_server, "manager", self.fake)
         self._patch.start()
         self.addCleanup(self._patch.stop)
+        # 这些用例只验证 resolution 校验: 批量行带 upload path 时创建接口还会检查
+        # 上传 token (validate_task_upload), 给个兜底 token 排除干扰.
+        env = mock.patch.dict(os.environ, {"ACCESS_TOKEN": "test-token"})
+        env.start()
+        self.addCleanup(env.stop)
 
     def test_single_rejects_bad_resolution_with_400(self):
         for bad in ("480", "0p", "854x", "abc"):

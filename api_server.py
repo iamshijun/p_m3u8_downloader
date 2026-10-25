@@ -14,11 +14,15 @@
     BATCH_LIMIT                单次批量导入任务上限 (默认 500)
     MAX_REGISTRY               任务注册表最大条目数 (默认 2000)
     TASK_TTL_SECONDS           已结束任务保留时间 (默认 1800)
-    ACCESS_TOKEN               上传后端未显式传 token 时的兜底 token
+    ACCESS_TOKEN               上传 token 兜底值: 仅当任务未提供 upload.token 时使用
 
 接口:
     POST   /api/download              → 创建下载任务, 返回 {task_id}
+                                        必填参数的前置校验不通过时 400 + 中文 detail
+                                        (m3u8 来源 / 清晰度上限 / 上传前置条件),
+                                        必然失败的任务不会被创建
     POST   /api/download/batch        → 批量创建下载任务, 返回 {created, skipped, errors}
+                                        单行不合法只进 errors, 不影响同批其他行
     GET    /api/tasks                 → 列出所有任务 (状态快照)
     POST   /api/tasks/cancel-pending  → 取消所有排队中 (pending) 的任务
     GET    /api/tasks/{id}            → 单个任务详情
@@ -51,6 +55,7 @@ import queue
 import re
 import threading
 import time
+import traceback
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -182,6 +187,39 @@ def validate_resolution_limit(raw: Optional[str]) -> Optional[str]:
         parse_resolution_limit(raw)
     except ValueError as e:
         return str(e)
+    return None
+
+
+# 上传前置条件失败的两种原因. 抽成常量, 保证 "创建前拦截" 与 _run() 的兼容兜底
+# 输出完全一致 (用户在弹窗里看到的和日志里记的是同一句话).
+UPLOAD_TOKEN_HINT = (
+    "缺少上传 token: 请求未提供 upload.token, 且 .env 未配置 ACCESS_TOKEN "
+    "(ACCESS_TOKEN 仅作兜底)"
+)
+NO_DISK_NEEDS_UPLOAD = "--no-disk 需要 --upload"
+
+
+def validate_task_upload(
+    upload: Optional["UploadConfig"],
+    *,
+    no_disk: bool = False,
+) -> Optional[str]:
+    """校验任务的上传前置条件: 合法返回 None, 否则返回可读的中文原因.
+
+    这些条件在 `_run()` 里是**必然失败**的 (不触网也立刻报错), 所以在创建任务前
+    就先拦下: 单条请求返回 400, 批量导入逐行进 errors —— 不制造“注定失败的
+    任务记录”, 也就不会出现『任务秒变 error 但看不出为什么』的历史现象.
+
+    - `--no-disk` 必须配合上传: 不落盘时数据只能交给 upload hook
+    - 上传需要 token: 任务自带的 `upload.token` 优先, `.env` 的 `ACCESS_TOKEN`
+      仅兜底; 两者皆空就是必然失败
+
+    用例表: tests/test_upload_token_priority.py
+    """
+    if no_disk and upload is None:
+        return NO_DISK_NEEDS_UPLOAD
+    if upload is not None and not (upload.token or os.getenv("ACCESS_TOKEN")):
+        return UPLOAD_TOKEN_HINT
     return None
 
 
@@ -494,6 +532,52 @@ def _remove_empty_dir(path: Optional[str]) -> None:
         pass  # 不存在 / 非空 (下载器已接管或 keep_temp)
 
 
+def _fail_task(
+    task: "Task",
+    message: str,
+    *,
+    stage: Optional[str] = None,
+    exc: Optional[BaseException] = None,
+) -> None:
+    """把任务标记为失败, 并把原因写进服务端日志 (任务失败的唯一出口).
+
+    只写 task.error 的话 run/server.log 里完全没有失败原因, 而秒失败的任务
+    (缺少上传 token / 预检失败) 在前端也订阅不到事件流, 于是"没有任何错误信息".
+
+    Args:
+        message: 面向用户的错误文本 (同时进日志)
+        stage: 失败阶段标记 (如 "preflight"), 会随 status 事件一起推给前端
+        exc: 触发失败的异常; 传了就在日志里附完整 traceback
+    """
+    task.error = message
+    where = f" ({stage})" if stage else ""
+    log(f"[!] 任务 {task.id} 失败{where}: {message}")
+    if exc is not None:
+        # 在 except 块内调用时 sys.exc_info() 仍然有效, 这里能拿到完整 traceback
+        log(traceback.format_exc().rstrip())
+    extra: dict = {}
+    if stage is not None:
+        extra["stage"] = stage
+    if exc is not None:
+        extra["exception"] = type(exc).__name__
+    task.set_status(TaskStatus.ERROR, message=message, **extra)
+
+
+def _upload_token_source(upload: Optional["UploadConfig"]) -> Optional[str]:
+    """本次任务实际使用的上传 token 来源.
+
+    ``"task"`` = 请求/表单自带的 upload.token (优先)
+    ``"env"``  = .env 的 ACCESS_TOKEN (仅兜底)
+    ``None``   = 不上传
+
+    批量导入把它回显给前端, 用用户一眼就能看出"我填的 token 到底用上了没",
+    不用再去猜是前端没带上还是后端没兜底.
+    """
+    if upload is None:
+        return None
+    return "task" if upload.token else "env"
+
+
 def _run_preflight(hook_type: str, token: str, task: Optional[Task] = None) -> dict:
     """上传预检: 根据后端类型执行认证/连通性检查 (统一走 m3u8_downloader.upload_preflight).
 
@@ -632,6 +716,14 @@ class TaskManager:
         task.set_status(TaskStatus.RUNNING)
         tmp_dir: Optional[str] = None
         try:
+            # 请求层面必然失败的组合 (缺 token / no_disk 缺 upload): 创建接口已经拦过
+            # 一遍, 这里兜底直接调用 manager.create() 的场景. 放在建目录之前,
+            # 避免留下一个永远用不上的空任务目录.
+            upload_error = validate_task_upload(req.upload, no_disk=req.no_disk)
+            if upload_error:
+                _fail_task(task, upload_error)
+                return
+
             # 每个任务独立目录, 避免输出/临时文件冲突
             task_dir = os.path.join(DOWNLOAD_ROOT, task.id)
             os.makedirs(task_dir, exist_ok=True)
@@ -650,10 +742,8 @@ class TaskManager:
 
             no_merge = req.no_merge
             if req.no_disk:
-                if not req.upload:
-                    task.error = "--no-disk 需要 --upload"
-                    task.set_status(TaskStatus.ERROR, message=task.error)
-                    return
+                # 不落盘模式没有临时目录可合并, 只能直接交给上传 hook
+                # (no_disk 与 upload 的搭配已由 validate_task_upload() 保证)
                 no_merge = True
 
             hooks: list[BaseHook] = [
@@ -670,18 +760,17 @@ class TaskManager:
 
             if req.upload:
                 upload_cfg = req.upload
+                # token 优先级: 任务自带的 upload.token (前端表单/请求) > .env 的
+                # ACCESS_TOKEN. 后者只是兜底, 不能用它覆盖前端明确指定的 token,
+                # 也不应当被用户误读成"启用上传就必须配置 ACCESS_TOKEN".
+                # 两者皆空的情况已由 validate_task_upload() 拦下, 这里必非空.
                 token = upload_cfg.token or os.getenv("ACCESS_TOKEN")
-                if not token:
-                    task.error = "upload 需要 upload.token 或 .env ACCESS_TOKEN"
-                    task.set_status(TaskStatus.ERROR, message=task.error)
-                    return
                 # 下载前预检 (按后端类型分别校验)
                 task.emit({"type": "preflight", "upload": upload_cfg.path, "backend": upload_cfg.type})
                 try:
                     quota = _run_preflight(upload_cfg.type, token, task)
                 except Exception as e:
-                    task.error = f"上传预检失败: {e}"
-                    task.set_status(TaskStatus.ERROR, message=task.error, stage="preflight")
+                    _fail_task(task, f"上传预检失败: {e}", stage="preflight", exc=e)
                     return
                 task.emit({
                     "type": "preflight_ok",
@@ -737,11 +826,11 @@ class TaskManager:
         except _Cancelled:
             task.set_status(TaskStatus.CANCELLED, reason="运行中取消")
         except SystemExit as e:
-            task.error = f"下载器退出: {e}"
-            task.set_status(TaskStatus.ERROR, message=task.error)
+            _fail_task(task, f"下载器退出: {e}")
         except Exception as e:
-            task.error = str(e)
-            task.set_status(TaskStatus.ERROR, message=task.error, exception=type(e).__name__)
+            # str(e) 可能为空 (如无参的 ConnectionResetError()), 退回类型名,
+            # 避免前端只显示一个空白的"错误"
+            _fail_task(task, str(e) or f"{type(e).__name__} (无错误信息)", exc=e)
         finally:
             # 兜底: 预检失败/提前退出时清掉已经建成但没用到的临时目录
             _remove_empty_dir(tmp_dir)
@@ -772,6 +861,9 @@ def download(req: DownloadRequest) -> dict:
     res_error = validate_resolution_limit(req.resolution)
     if res_error:
         raise HTTPException(status_code=400, detail=res_error)
+    upload_error = validate_task_upload(req.upload, no_disk=req.no_disk)
+    if upload_error:
+        raise HTTPException(status_code=400, detail=upload_error)
     task = manager.create(req)
     return {"task_id": task.id, "status": task.status}
 
@@ -840,10 +932,21 @@ def download_batch(req: BatchDownloadRequest) -> dict:
             errors.append({"line": line_no, "reason": f"参数校验失败: {e}", "input": url})
             continue
 
+        # 必然失败的上传前置条件 (缺 token / no_disk 缺 upload): 逐行报错, 不建任务
+        upload_error = validate_task_upload(task_req.upload, no_disk=task_req.no_disk)
+        if upload_error:
+            errors.append({"line": line_no, "reason": upload_error, "input": url})
+            continue
+
         seen_urls.add(url)
         seen_names.add(name_key)
         task = manager.create(task_req)
-        created.append({"task_id": task.id, "m3u8_input": url, "upload": upload_path})
+        created.append({
+            "task_id": task.id,
+            "m3u8_input": url,
+            "upload": upload_path,
+            "token_source": _upload_token_source(task_req.upload),
+        })
 
     return {"created": created, "skipped": skipped, "errors": errors}
 

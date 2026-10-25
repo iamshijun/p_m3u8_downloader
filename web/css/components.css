@@ -145,6 +145,19 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .task-log .l-err { color: var(--err); }
 .task-log .l-warn{ color: var(--warn); }
 
+/* 任务失败原因内联显示 (秒失败的任务订阅不到事件流, 靠快照渲染) */
+.task-error {
+  margin-top: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--err);
+  border-radius: 4px;
+  background: rgba(239, 68, 68, 0.12);
+  color: var(--err);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 /* 模态框 */
 .modal-mask {
   position: fixed;

@@ -37,6 +37,7 @@ function ensureCard(snap) {
       <div>结束: <b class="finished-at">-</b></div>
       <div>耗时: <b class="elapsed">-</b></div>
     </div>
+    <div class="task-error" style="display:none"></div>
     <details><summary>日志</summary><div class="task-log"></div></details>
   `;
   $("taskList").prepend(card);
@@ -56,6 +57,8 @@ function ensureCard(snap) {
     startedAtEl: card.querySelector(".started-at"),
     finishedAtEl: card.querySelector(".finished-at"),
     elapsedEl: card.querySelector(".elapsed"),
+    errEl: card.querySelector(".task-error"),
+    lastError: null,
     logEl: card.querySelector(".task-log"),
     btnCancel: card.querySelector(".btn-cancel"),
     btnRemove: card.querySelector(".btn-remove"),
@@ -90,6 +93,25 @@ function setProgress(t, done, total) {
   t.bar.textContent = p.toFixed(1) + "%";
   t.doneEl.textContent = done;
   t.totalEl.textContent = total;
+}
+
+// 内联显示/清除错误文本 (幂等: 同一文本只记一行日志, 轮询与事件流不会重复)
+// 秒失败的任务 (如缺少上传 token) 在 refresh() 时已是终态, 订阅不到事件流,
+// 只能靠快照把 snap.error 渲染出来.
+function setError(t, message) {
+  if (!t) return;
+  const text = String(message == null ? "" : message).trim();
+  if (!text) {
+    t.errEl.style.display = "none";
+    t.errEl.textContent = "";
+    t.lastError = null;
+    return;
+  }
+  if (t.lastError === text) return;
+  t.lastError = text;
+  t.errEl.textContent = "✘ " + text;
+  t.errEl.style.display = "";
+  tlog(t, "✘ 错误: " + text, "l-err");
 }
 
 function fmtTime(ts) {
@@ -158,6 +180,7 @@ function applySnapshot(t, snap) {
   if (snap.encrypted != null) t.encEl.textContent = snap.encrypted ? "AES-128" : "否";
   if (snap.size != null) t.sizeEl.textContent = humanSize(snap.size);
   if (snap.result) { t.resultWrap.style.display = ""; t.resultEl.textContent = snap.result; }
+  setError(t, snap.status === "error" ? (snap.error || "未知错误") : null);
   setTimes(t, snap);
 }
 
@@ -173,6 +196,7 @@ export const taskCard = {
   log(id, msg, cls) { return tlog(tasks[id], msg, cls); },
   setStatus(id, status) { return setStatusBadge(tasks[id], status); },
   setProgress(id, done, total) { return setProgress(tasks[id], done, total); },
+  setError(id, message) { return setError(tasks[id], message); },
 
   // 绑定取消/删除按钮回调 (仅首次, 避免重复绑定)
   bindControls(id, onCancel, onRemove) {
