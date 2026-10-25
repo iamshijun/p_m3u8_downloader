@@ -1030,8 +1030,25 @@ async def stream_task(task_id: str, request: Request) -> StreamingResponse:
 
 # 静态页面挂载 (放最后, 避免拦截 /api/*)
 _WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "web")
+
+
+class _RevalidatingStaticFiles(StaticFiles):
+    """静态资源加 ``Cache-Control: no-cache``: 允许缓存, 但每次使用前必须校验.
+
+    ``web/`` 下是未打包的 ES 模块. StaticFiles 默认不发 Cache-Control, 浏览器就按
+    启发式规则 (约 last-modified 至今的 10%) 直接复用缓存; 而已经加载进页面的模块
+    更是一直用到刷新为止 —— 改了前端却只看到旧行为, 很容易误判成"后端没生效".
+    no-cache 要求每次带 ETag/Last-Modified 回源校验: 没变时仍然是 304, 开销极小.
+    """
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 if os.path.isdir(_WEB_DIR):
-    app.mount("/", StaticFiles(directory=_WEB_DIR, html=True), name="web")
+    app.mount("/", _RevalidatingStaticFiles(directory=_WEB_DIR, html=True), name="web")
 
 
 if __name__ == "__main__":
