@@ -3,7 +3,7 @@
 #
 # 用法:
 #   ./scripts/restart.sh                  # 后台重启
-#   ./scripts/restart.sh foreground       # 前台重启 (透传给 start.sh)
+#   ./scripts/restart.sh foreground       # 前台重启 (等同 -f / --foreground, 透传给 start.sh)
 #
 # stop.sh 无参数且总是 exit 0; "$@" 原样透传给 start.sh.
 set -euo pipefail

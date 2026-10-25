@@ -34,7 +34,7 @@ RUN_MODE="background"
 for arg in "$@"; do
     case "$arg" in
         foreground|-f|--foreground) RUN_MODE="foreground" ;;
-        *) echo "[error] 未知参数: $arg (无参=后台, foreground=前台)" >&2; exit 2 ;;
+        *) echo "[error] 未知参数: $arg (无参=后台, -f/--foreground=前台)" >&2; exit 2 ;;
     esac
 done
 
