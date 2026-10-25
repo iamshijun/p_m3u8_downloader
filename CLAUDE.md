@@ -53,6 +53,12 @@ Its `PARSE_CASES` / `INVALID_CASES` tables are likewise the **shared contract** 
 
 `tests/test_segment_filter.py` guards `--segments` (片段过滤): `ParseSegmentRangesTest` covers `M3U8Downloader._parse_segment_ranges()` (`"0,3,5"` → singles, `"10-20"` → inclusive range, `"1600-"` → to the end, invalid items warned + dropped), `ApplySegmentFilterTest` covers `_apply_segment_filter()` (range clipped at the tail, out-of-range start warned + ignored, all out of range → `M3U8DownloadError`, `M3U8Segment.index` keeps the original playlist position after filtering).
 
+`tests/test_static_assets.py` guards the static-asset cache contract: everything under `web/` is served with `Cache-Control: no-cache` (browsers must revalidate, so a `web/` edit is picked up on the next page load) while ETag/Last-Modified still produce `304` for unchanged files.
+
+`tests/test_upload_token_priority.py` guards the upload-token contract: `_run()` gives the task's `upload.token` priority over `.env` `ACCESS_TOKEN` (env used only when the task has none), `api_server.validate_task_upload()` is the single definition of the "would fail instantly" pre-conditions (missing token, `no_disk` without upload), and both creation entries reject them before `manager.create()` — `/api/download` → 400 with a Chinese `detail`, `/api/download/batch` → per-line `errors` — so no doomed task ever enters the registry. A missing-token `detail` is byte-identical to the `task.error` `_run()` would have produced (same constants).
+
+`tests/test_task_failure_logging.py` guards failure visibility in `TaskManager._run()` (`DOWNLOAD_ROOT` patched to a temp dir, `TaskManager.__new__` so no thread pool / cleanup thread): every failure exit goes through `_fail_task()` and prints `[!] 任务 <id> 失败...` with the reason, unexpected exceptions add a full traceback, and an empty `str(e)` falls back to the exception type name so the UI never shows a blank error.
+
 ## Architecture
 
 ```
@@ -108,14 +114,23 @@ Endpoints:
 ```
 POST   /api/download            — create a task, returns {task_id} (non-blocking);
                                  400 with a Chinese `detail` when `m3u8_input` fails
-                                 `validate_m3u8_source()`, or when `resolution` fails
-                                 `validate_resolution_limit()`
+                                 `validate_m3u8_source()`, when `resolution` fails
+                                 `validate_resolution_limit()`, or when the upload
+                                 pre-conditions fail `validate_task_upload()`
+                                 (missing token / `no_disk` without upload) — a task
+                                 that would fail instantly is never created
 POST   /api/download/batch      — batch create tasks, returns {created, skipped, errors}:
+                                 each `created` entry is `{task_id, m3u8_input, upload,
+                                 token_source}` where `token_source` is `task` (the
+                                 request/frontend supplied `upload.token`) or `env`
+                                 (fell back to `.env` `ACCESS_TOKEN`), so the UI can
+                                 show which token was actually used;
                                  dedupes by URL / sanitized output filename against the
                                  current registry + the batch itself; malformed entries
                                  land in errors (per-line, with optional `line` echoed back),
-                                 including `m3u8_input` scheme validation and
-                                 `resolution` format validation
+                                 including `m3u8_input` scheme validation,
+                                 `resolution` format validation and the same
+                                 `validate_task_upload()` pre-conditions
 GET    /api/tasks               — list all task snapshots
 POST   /api/tasks/cancel-pending — cancel every still-queued (`pending`) task in one
                                  call, returns `{cancelled: [task_id], count}`;
@@ -140,7 +155,7 @@ GET    /                         — serves web/index.html (StaticFiles)
 | `BATCH_LIMIT` | `500` | per-batch task limit on `/api/download/batch` |
 | `MAX_REGISTRY` | `2000` | registry cap; evicts oldest terminal tasks beyond it |
 | `TASK_TTL_SECONDS` | `1800` | how long terminal tasks stay in the registry |
-| `ACCESS_TOKEN` | — | fallback upload token when a task doesn't pass `upload.token` |
+| `ACCESS_TOKEN` | — | 上传 token **兜底值**: 仅在任务未提供 `upload.token` 时使用（请求 / 前端表单里的 token 优先，绝不覆盖它） |
 
 `_load_env_file()` prefers python-dotenv and falls back to a hand-rolled parser with `setdefault` semantics (existing env vars win), so `python3 api_server.py` works even on interpreters without python-dotenv.
 
@@ -152,7 +167,8 @@ Key design points:
 - **Progress**: `ProgressHook` (subclass of `BaseHook`) forwards `on_playlist_parsed / on_segment / on_segment_data / on_all_downloaded` into the task's event queue; `set_status()` broadcasts terminal states.
 - **Streaming/subscribe**: `Task.subscribe()` snapshots history and registers a queue under a lock (no lost/duplicate events); terminal state pushes a `None` sentinel to close streams. Reconnecting or opening a new tab replays history.
 - **Cancellation**: the downloader has no built-in cancel point. `CancelHook` checks `cancel_event` in segment callbacks and raises `_Cancelled(BaseException)` — deriving from `BaseException` (not `Exception`) bypasses the downloader's `except Exception` retry loop. Queued (not-yet-started) tasks are cancelled immediately via `future.cancel()`; running tasks are best-effort (in-flight segments may finish first).
-- **Upload preflight**: when `--upload` / `upload` is set, `m3u8_downloader.upload_preflight()` (the single shared entry point, called by both CLI `main()` and `api_server._run_preflight`) validates the token via `pan_upload.preflight_check()` **before** any segment is downloaded, so an expired token fails fast. `preflight_check` retries only transient failures (`httpx.RequestError`, 5xx/429, non-JSON body) with 1s/2s/4s backoff (`PREFLIGHT_RETRIES=3`); `PreflightAuthError` (errno != 0 / 401 / 403) propagates immediately with no retry. It deliberately ignores the task's proxy/headers (plain one-shot `httpx.get`). The API emits `preflight` / `preflight_retry` / `preflight_ok` events which the frontend renders.
+- **Failure visibility**: every failure exit in `_run()` goes through the module-level `_fail_task(task, message, stage=…, exc=…)`, which sets `task.error`, prints `[!] 任务 <id> 失败…` via `log()`, dumps the traceback when `exc` is given, then `set_status(ERROR, …)`. Writing only `task.error` hid the cause completely: `run/server.log` stayed silent and a task that dies *instantly* (missing upload token, failed preflight) is already terminal when the browser first subscribes, so nothing reached the UI either. `str(e)` empty → falls back to the exception type name (no blank error text).
+- **Upload preflight**: when `--upload` / `upload` is set, `m3u8_downloader.upload_preflight()` (the single shared entry point, called by both CLI `main()` and `api_server._run_preflight`) validates the token via `pan_upload.preflight_check()` **before** any segment is downloaded, so an expired token fails fast. **Token priority: the task's `upload.token` (frontend form / API request) always wins; `.env` `ACCESS_TOKEN` is only a fallback used when the task carries none** — `.env` is never required when the frontend supplies a token. The batch import carries the form's upload options (token / ondup / max_retries / delete_after_upload) into every task and only takes `path` from the line, so typing a token in the form works even with 远程目录 left blank. **Pre-conditions that would fail instantly are rejected at creation time** (`validate_task_upload()`: missing token, `no_disk` without upload) — `_run()` re-checks the same function as defense in depth, which is why the 400 `detail` and the `task.error` text come from shared constants. `preflight_check` retries only transient failures (`httpx.RequestError`, 5xx/429, non-JSON body) with 1s/2s/4s backoff (`PREFLIGHT_RETRIES=3`); `PreflightAuthError` (errno != 0 / 401 / 403) propagates immediately with no retry. It deliberately ignores the task's proxy/headers (plain one-shot `httpx.get`). The API emits `preflight` / `preflight_retry` / `preflight_ok` events which the frontend renders.
 - **`__main__`**: passes the `app` object (not the `"api_server:app"` string) to `uvicorn.run` — the string form makes uvicorn re-import the module as `api_server`, executing the module-level `manager = TaskManager(...)` twice (two thread pools + two cleanup threads, the `__main__` copy a pure leak).
 - **Note**: the task registry is in-memory; a server restart loses task records (files under `downloads/` remain).
 
@@ -233,7 +249,10 @@ Single-file frontend served by `api_server.py`. Multi-task download manager:
 - **Form memory**: on successful submit, `saveForm()` persists the form to `localStorage["m3u8_last_form"]`; `restoreForm()` refills it on next load (includes `upload_token`).
 - **Source validation (`web/js/utils/validate.js`)**: `validateM3u8Source()` mirrors `api_server.validate_m3u8_source()` — a source with a scheme must be `http`/`https` with a non-empty host (so `hhttps://` is rejected), while a scheme-less string is treated as a local path and passes; `http:/x` (missing `//`) is also flagged. The single-task form validates on submit, and batch import validates every line in `updateImportPreview()`, which disables "导入" and shows the offending line's raw text; `importTasks()` hard-returns before `createBatchTasks()` whenever any line fails, so a bad batch never hits the API. Dedupe `skipped` entries are **not** treated as errors and never block a batch.
 - **Resolution cap validation (`validateResolutionLimit()` in the same file)**: mirrors `m3u8_downloader.parse_resolution_limit()` (empty/absent = unrestricted, `480p` = height only, `854x480` = both dimensions, anything else rejected) and returns the downloader's message, so the user sees the same text as the API. Checked on submit by the single-task form, and once against the shared form config before batch import (`resolution` is a form-level option, so it is not part of the per-line `updateImportPreview()` sweep).
+- **Static asset caching (`_RevalidatingStaticFiles`)**: `web/` is mounted with `Cache-Control: no-cache` (ETag/Last-Modified kept, so unchanged files still answer `304`). ES modules are fetched **once per page load**, so after editing anything under `web/` an already-open tab keeps running the old code until the page is reloaded — restarting the server does not refresh it. `tests/test_static_assets.py` guards both halves (header present, 304 on unchanged).
 - **Layout / responsive (`web/css/layout.css`)**: the task-list `h2` is a 3-track grid (`minmax(0,1fr) auto minmax(0,1fr)`) so 「运行中/等待中/总计」 is *truly* centered regardless of the title / button-group widths; `@media (max-width: 720px)` keeps the form `.grid` two-column (all short numeric fields) but turns `.actions` into a `1fr 1fr` (2×2) grid — the button labels are long — and moves the `h2` button group to its own full-width row via `grid-template-areas` (`.btn-group` is a segmented control: `inline-flex` + 1px gap, rounded only on the outer corners).
+- **Failure rendering (`taskCard.setError()`)**: `applySnapshot()` renders `snap.error` into an inline `.task-error` block whenever `status === "error"` — this is the *only* path an instantly-failed task can take, because `refresh()` subscribes streams only for `running` tasks, so a task that is already terminal never gets an event replay. `eventStream` routes the live `status`/`error` event through the same function, and both paths are idempotent (`lastError` guard) so the 2s poll doesn't duplicate the log line.
+- **Batch import carries the upload options (`collectUploadOptions()`)**: `importTasks()` rebuilds each task's `upload` from the form on every submit (`Object.assign({}, collectUploadOptions(), { path: <line filename> })`) instead of inheriting `shared.upload` — the inherited object only exists when 远程目录 is filled, so inheriting silently dropped `token` / `ondup` / `max_retries` / `delete_after_upload` (the old `else` branch sent a bare `{type, path}`, which is why a task could fail with "缺少上传 token" even though the form had one). The import preview now also shows `token: 表单` vs `token: 仅 .env 兜底` before submitting, and the result line echoes the backend's `created[].token_source` so "did my token get used?" is answered on screen.
 - **Export pending (`导出等待中` → `exportPending()`)**: fetches `/api/tasks`, keeps only `pending` tasks, and downloads them as `pending-<epoch-ms>.txt` — one `文件名 URL` line per task, byte-for-byte the same shape `parseImportText()` accepts, so the file round-trips through 「选择 .txt 文件」. The first field is `snapshot.upload` (the remote upload path) falling back to `snapshot.output`, with whitespace collapsed to `_` to keep the two-field line unambiguous. Built client-side via `Blob` + `URL.createObjectURL`, no backend endpoint and no new modal.
 - **Cancel all pending (`取消全部等待中` → `cancelAllPending()`)**: confirms the count from a fresh `/api/tasks` snapshot, then makes one `POST /api/tasks/cancel-pending` call and applies the returned ids (`taskCard.setStatus()`) before `refresh()`. Deliberately **not** N × `cancelTask()` — a 500-task batch would otherwise fire 500 requests. `running` tasks are intentionally excluded (they'd need the `CancelHook` path one by one, still available via the per-card 取消 button).
 
