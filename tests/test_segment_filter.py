@@ -3,6 +3,7 @@
 覆盖:
   1. M3U8Downloader._parse_segment_ranges()  —— 表达式解析 (单个位置 / 闭区间 / 开区间)
   2. M3U8Downloader._apply_segment_filter()  —— 按解析结果过滤 playlist, 保留原始序号
+  3. playlist.m3u8 的上传内容 —— 始终是完整清单, 不受只下载部分分片影响
 
 支持的位置表达式 (0 起始):
     "0,3,5"   单个位置
@@ -22,11 +23,13 @@ import io
 import unittest
 
 from m3u8_downloader import (
+    BaseHook,
     DownloadConfig,
     M3U8DownloadError,
     M3U8Downloader,
     M3U8Playlist,
     M3U8Segment,
+    YunpanUploadHook,
 )
 
 # (输入, 期望的区间列表) —— None 表示不限制; (start, end) 中 end 为 None 表示到末尾
@@ -160,6 +163,84 @@ class ApplySegmentFilterTest(unittest.TestCase):
             downloader._apply_segment_filter(playlist)
         self.assertEqual([seg.index for seg in playlist.segments], list(range(100, 150)))
         self.assertEqual(playlist.segments[0].uri, "seg100.ts")
+
+
+class _FakeHTTP:
+    """只回应固定内容的假 HTTP 客户端 (总 N 个分片, 分片返回占位字节)."""
+
+    def __init__(self, total: int) -> None:
+        self._content = (
+            "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:10\n"
+            + "".join(f"#EXTINF:10.0,\nseg{idx}.ts\n" for idx in range(total))
+            + "#EXT-X-ENDLIST\n"
+        )
+
+    def get_text(self, url: str, max_bytes: "int | None" = None) -> str:
+        return self._content
+
+    def get(self, url: str) -> bytes:
+        return b"data"
+
+
+class PlaylistUploadCompletenessTest(unittest.TestCase):
+    """playlist.m3u8 的生成/上传内容必须是完整清单.
+
+    --segments 只影响**下载哪些分片**, 不影响 playlist.m3u8 的内容: 分批下载并
+    上传到同一个远端目录时, 用只含本批分片的清单会覆盖掉远端已累计的完整清单.
+    """
+
+    def _run_pipeline(self, segments_spec: "str | None", total: int = 4) -> dict:
+        """跑一遍 pipeline (不真的下载分片), 收集 hook 看到的数据和上传的内容."""
+        seen: dict = {}
+
+        class Recorder(BaseHook):
+            def on_playlist_parsed(self, ctx) -> None:
+                seen["playlist"] = [seg.index for seg in ctx.playlist.segments]
+                seen["full_playlist"] = [seg.index for seg in ctx.full_playlist.segments]
+
+        # 绕过 __init__: 本用例只关心 on_playlist_parsed 的选择逻辑 (无需 token / pan_upload)
+        upload = YunpanUploadHook.__new__(YunpanUploadHook)
+        upload.remote_prefix = "/remote"
+        upload._do_upload_bytes = lambda data, filename, remote_path: seen.update(
+            uploaded=data.decode("utf-8"), filename=filename, remote_path=remote_path
+        )
+
+        downloader = M3U8Downloader(
+            DownloadConfig(
+                m3u8_source="https://example.com/playlist.m3u8",
+                segments=segments_spec,
+                quiet=True,
+                no_merge=True,
+            ),
+            http_client=_FakeHTTP(total),
+            hooks=[Recorder(), upload],
+        )
+        downloader._download_segments = lambda playlist: []  # 分片下载与断言无关
+        with contextlib.redirect_stdout(io.StringIO()):
+            downloader.run()
+        return seen
+
+    def test_partial_download_still_uploads_full_playlist(self):
+        """--segments 1-2: 只下载 2 个分片, 但上传的 playlist 含全部 4 个."""
+        seen = self._run_pipeline("1-2")
+        self.assertEqual(seen["playlist"], [1, 2])            # 实际下载的分片
+        self.assertEqual(seen["full_playlist"], [0, 1, 2, 3])  # 上传用的完整清单
+        for idx in range(4):
+            self.assertIn(f"seg_{idx:06d}", seen["uploaded"])
+
+    def test_no_filter_uploads_full_playlist(self):
+        for spec in (None, "", "0-"):
+            with self.subTest(spec=spec):
+                seen = self._run_pipeline(spec)
+                self.assertEqual(seen["playlist"], [0, 1, 2, 3])
+                self.assertEqual(seen["full_playlist"], [0, 1, 2, 3])
+                self.assertEqual(seen["uploaded"].count("#EXTINF"), 4)
+
+    def test_upload_target_unchanged(self):
+        """文件名 / 远端路径不受本次修改影响."""
+        seen = self._run_pipeline("2")
+        self.assertEqual(seen["filename"], "playlist.m3u8")
+        self.assertEqual(seen["remote_path"], "/remote/playlist.m3u8")
 
 
 if __name__ == "__main__":

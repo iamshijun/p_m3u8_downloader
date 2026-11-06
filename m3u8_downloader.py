@@ -361,6 +361,9 @@ class HookContext:
 
     # --- on_playlist_parsed ---
     playlist: Optional[M3U8Playlist] = None
+    # 片段过滤 (--segments) 之前的完整 playlist. 生成 playlist.m3u8 必须用它:
+    # 分批下载/上传时用只含本批分片的清单会覆盖掉远端已累计的完整清单.
+    full_playlist: Optional[M3U8Playlist] = None
 
     # --- on_segment / on_segment_data ---
     segment_index: int = 0
@@ -508,8 +511,14 @@ class YunpanUploadHook(UploadHook):
             raise
 
     def on_playlist_parsed(self, ctx: HookContext):
-        content = ctx.playlist.to_file_content()
-        log(f"[*] upload m3u8 to {self.remote_prefix}/playlist.m3u8")
+        # playlist.m3u8 始终写完整清单: --segments 分批下载时, 每次只用本批分片
+        # 生成会覆盖远端已累计的完整清单 (分片文件名按原始序号, 各批次互相兼容)
+        playlist = ctx.full_playlist or ctx.playlist
+        content = playlist.to_file_content()
+        suffix = ""
+        if ctx.playlist is not None and len(ctx.playlist) != len(playlist):
+            suffix = f" (完整 {len(playlist)} 个片段, 本次下载 {len(ctx.playlist)} 个)"
+        log(f"[*] upload m3u8 to {self.remote_prefix}/playlist.m3u8{suffix}")
         self._do_upload_bytes(content.encode("utf-8"), "playlist.m3u8", f"{self.remote_prefix}/playlist.m3u8")
 
     def on_segment(self, ctx: HookContext) -> None:
@@ -748,6 +757,10 @@ class M3U8Downloader:
             log(f"[*] 非 master playlist (单一清晰度), 清晰度上限 "
                 f"{format_resolution_limit(self._resolution_limit)} 无法应用, 已忽略")
 
+        # 片段过滤会原地改写 playlist.segments, 先留一份完整副本:
+        # playlist.m3u8 (上传) 必须是完整清单, 不受本批只下载部分分片影响
+        full_playlist = replace(playlist, segments=list(playlist.segments))
+
         # 指定片段过滤: 只保留指定位置的片段 (0 起始; 支持 0,3,5 / 10-20 / 1600-), 其余过滤掉
         self._apply_segment_filter(playlist)
 
@@ -763,7 +776,7 @@ class M3U8Downloader:
                 raise M3U8DownloadError("[!] 检测到加密片段, 但未安装 pycryptodome. 请运行: pip install pycryptodome")
             log("[*] 检测到 AES-128 加密, 密钥已加载")
             
-        ctx = HookContext(playlist=playlist)
+        ctx = HookContext(playlist=playlist, full_playlist=full_playlist)
         for hook in self.hooks:
             hook.on_playlist_parsed(ctx)
             if not ctx.should_continue:
@@ -795,7 +808,7 @@ class M3U8Downloader:
         segment_paths = self._download_segments(playlist)
 
         # 调用 on_all_downloaded
-        ctx = HookContext(playlist=playlist, tmp_dir=self.config.tmp_dir)
+        ctx = HookContext(playlist=playlist, full_playlist=full_playlist, tmp_dir=self.config.tmp_dir)
         for hook in self.hooks:
             hook.on_all_downloaded(ctx)
             if not ctx.should_continue:
